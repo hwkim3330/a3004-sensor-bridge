@@ -17,12 +17,14 @@ start_service() {
 	config_get remote  control remote
 	config_get rate    control rate 20
 	config_get timeout control timeout 300
+	config_get cmd_port control cmd_port 7721
 
 	procd_open_instance
 	procd_set_param command "$PROG" \
 		--port "$port" \
 		--rate "$rate" \
 		--timeout "$timeout" \
+		--cmd-port "$cmd_port" \
 		--status /var/run/teleop.json
 
 	[ -n "$remote" ] && procd_append_param command --remote "$remote"

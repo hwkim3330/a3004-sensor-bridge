@@ -48,11 +48,14 @@
 #define AXES		4
 #define PKT_LEN		32
 #define AXIS_SCALE	10000		/* fixed point: -1.0 .. 1.0 */
+#define CMD_MAGIC	"TCMD"
+#define CMD_LEN		24
 
 static struct {
 	int port;			/* HTTP port for the browser */
 	struct sockaddr_in peer;	/* where intent is forwarded */
 	bool have_peer;
+	int cmd_port;			/* UDP command input, 0 = off */
 	int rate_hz;			/* forward cadence */
 	int timeout_ms;			/* deadman */
 	char *status_path;
@@ -66,6 +69,7 @@ static struct {
 	uint64_t last_cmd_ms;
 	uint64_t commands, rejected_seq, malformed, deadman_trips, sent;
 	uint64_t refused, reaped;
+	uint64_t udp_commands, udp_malformed;
 } g;
 
 static volatile sig_atomic_t stop_requested;
@@ -190,6 +194,10 @@ static void status_write(void)
 	fprintf(f, "\t\"clients\": %d,\n", ncl);
 	fprintf(f, "\t\"refused\": %llu,\n", (unsigned long long)g.refused);
 	fprintf(f, "\t\"reaped\": %llu,\n", (unsigned long long)g.reaped);
+	fprintf(f, "\t\"udp_commands\": %llu,\n",
+		(unsigned long long)g.udp_commands);
+	fprintf(f, "\t\"udp_malformed\": %llu,\n",
+		(unsigned long long)g.udp_malformed);
 	fprintf(f, "\t\"axes\": [");
 	for (i = 0; i < AXES; i++)
 		fprintf(f, "%s%.4f", i ? ", " : "",
@@ -236,28 +244,32 @@ static int clamp_axis(int v)
  * Axes are integers in units of 1/10000, which keeps the wire integer-only and
  * avoids locale-dependent float parsing on both sides.
  */
-static void handle_cmd(const char *qs)
+static bool seq_accept(uint32_t seq)
 {
-	int seq, arm, i;
-	bool have_seq;
-
-	seq = qs_int(qs, "s", -1, &have_seq);
-	if (!have_seq) {
-		g.malformed++;
-		return;
+	/* Reject replays and reordering. A restarted client resets its sequence,
+	 * which would otherwise lock it out for good, so a large backwards jump
+	 * is treated as a restart rather than a replay. */
+	if (g.commands && seq <= g.seq_in) {
+		if (g.seq_in - seq > 1000) {
+			logmsg(LOG_NOTICE, "client restarted (seq %u -> %u)",
+			       g.seq_in, seq);
+		} else {
+			g.rejected_seq++;
+			return false;
+		}
 	}
-
-	/* Reject replays and reordering: UDP-style thinking applied to HTTP,
-	 * because a retried or delayed request is a stale command. */
-	if (g.commands && (uint32_t)seq <= g.seq_in) {
-		g.rejected_seq++;
-		return;
-	}
-	g.seq_in = (uint32_t)seq;
+	g.seq_in = seq;
 	g.commands++;
 	g.last_cmd_ms = now_ms();
+	return true;
+}
 
-	arm = qs_int(qs, "arm", 0, NULL);
+/* One place where a decoded command becomes state, so the HTTP and UDP paths
+ * cannot drift apart on arming or clamping. */
+static void apply_cmd(bool arm, const int *axes, uint16_t buttons)
+{
+	int i;
+
 	if (!arm) {
 		disarm("client requested");
 		return;
@@ -266,14 +278,70 @@ static void handle_cmd(const char *qs)
 		g.armed = true;
 		logmsg(LOG_NOTICE, "armed");
 	}
+	for (i = 0; i < AXES; i++)
+		g.axis[i] = (int16_t)clamp_axis(axes[i]);
+	g.buttons = buttons;
+}
 
+static void handle_cmd(const char *qs)
+{
+	int seq, arm, i, axes[AXES];
+	bool have_seq;
+
+	seq = qs_int(qs, "s", -1, &have_seq);
+	if (!have_seq) {
+		g.malformed++;
+		return;
+	}
+	if (!seq_accept((uint32_t)seq))
+		return;
+
+	arm = qs_int(qs, "arm", 0, NULL);
 	for (i = 0; i < AXES; i++) {
 		char key[4];
 
 		snprintf(key, sizeof(key), "a%d", i);
-		g.axis[i] = (int16_t)clamp_axis(qs_int(qs, key, 0, NULL));
+		axes[i] = qs_int(qs, key, 0, NULL);
 	}
-	g.buttons = (uint16_t)qs_int(qs, "b", 0, NULL);
+	apply_cmd(arm != 0, axes, (uint16_t)qs_int(qs, "b", 0, NULL));
+}
+
+/*
+ * The native app path. A browser has to use HTTP; an app does not, and UDP
+ * removes the whole class of problems that came with a request per command -
+ * connection limits, keep-alive parsing, and Chrome's cap on in-flight fetches.
+ *
+ *   0  4  magic "TCMD"
+ *   4  1  version 1
+ *   5  1  flags: bit0 = arm
+ *   6  2  reserved
+ *   8  4  uint32 sequence
+ *  12  8  4 x int16 axes, units of 1/10000
+ *  20  2  uint16 buttons
+ *  22  2  reserved
+ */
+static void handle_udp_cmd(const uint8_t *p, size_t len)
+{
+	int axes[AXES], i;
+	uint32_t seq;
+
+	if (len < CMD_LEN || memcmp(p, CMD_MAGIC, 4) || p[4] != 1) {
+		g.udp_malformed++;
+		return;
+	}
+
+	seq = (uint32_t)p[8] | ((uint32_t)p[9] << 8) |
+	      ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
+	if (!seq_accept(seq))
+		return;
+
+	for (i = 0; i < AXES; i++)
+		axes[i] = (int16_t)((uint16_t)p[12 + i * 2] |
+				    ((uint16_t)p[13 + i * 2] << 8));
+
+	g.udp_commands++;
+	apply_cmd((p[5] & 1) != 0, axes,
+		  (uint16_t)((uint16_t)p[20] | ((uint16_t)p[21] << 8)));
 }
 
 
@@ -403,6 +471,7 @@ static void usage(const char *a0)
 "  -p, --port PORT        HTTP port the browser posts to (default 8083)\n"
 "  -r, --remote HOST:PORT forward intent here (default port 7720)\n"
 "  -H, --rate HZ          forward cadence (default 20)\n"
+"  -c, --cmd-port PORT    also accept commands as UDP, for a native app\n"
 "  -t, --timeout MS       deadman: neutral and disarm after this long without\n"
 "                         a command (default 300)\n"
 "  -S, --status PATH      JSON status (default /var/run/teleop.json)\n"
@@ -432,24 +501,26 @@ int main(int argc, char **argv)
 		{ "port",       required_argument, NULL, 'p' },
 		{ "remote",     required_argument, NULL, 'r' },
 		{ "rate",       required_argument, NULL, 'H' },
+		{ "cmd-port",   required_argument, NULL, 'c' },
 		{ "timeout",    required_argument, NULL, 't' },
 		{ "status",     required_argument, NULL, 'S' },
 		{ "foreground", no_argument,       NULL, 'f' },
 		{ "help",       no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
-	struct pollfd pfd[1 + MAX_CLIENTS];
+	struct pollfd pfd[2 + MAX_CLIENTS];
 	struct sockaddr_in a;
 	struct sigaction sa;
-	int lfd, usock = -1, on = 1, opt, i;
+	int lfd, usock = -1, cfd = -1, on = 1, opt, i;
 	uint64_t next_tx = 0, next_status = 0;
 
 	g.port = 8083;
 	g.rate_hz = 20;
+	g.cmd_port = 7721;
 	g.timeout_ms = 300;
 	g.status_path = (char *)"/var/run/teleop.json";
 
-	while ((opt = getopt_long(argc, argv, "p:r:H:t:S:fh", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:r:H:c:t:S:fh", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'p': g.port = atoi(optarg); break;
 		case 'r':
@@ -460,6 +531,7 @@ int main(int argc, char **argv)
 			g.have_peer = true;
 			break;
 		case 'H': g.rate_hz = atoi(optarg); break;
+		case 'c': g.cmd_port = atoi(optarg); break;
 		case 't': g.timeout_ms = atoi(optarg); break;
 		case 'S': g.status_path = optarg; break;
 		case 'f': g.foreground = true; break;
@@ -512,6 +584,30 @@ int main(int argc, char **argv)
 			      fcntl(usock, F_GETFL, 0) | O_NONBLOCK);
 	}
 
+	if (g.cmd_port > 0) {
+		struct sockaddr_in c;
+
+		cfd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (cfd >= 0) {
+			memset(&c, 0, sizeof(c));
+			c.sin_family = AF_INET;
+			c.sin_addr.s_addr = htonl(INADDR_ANY);
+			c.sin_port = htons((uint16_t)g.cmd_port);
+			setsockopt(cfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+			if (bind(cfd, (struct sockaddr *)&c, sizeof(c)) < 0) {
+				logmsg(LOG_WARNING, "cannot bind command port %d: %s",
+				       g.cmd_port, strerror(errno));
+				close(cfd);
+				cfd = -1;
+			} else {
+				fcntl(cfd, F_SETFL,
+				      fcntl(cfd, F_GETFL, 0) | O_NONBLOCK);
+				logmsg(LOG_NOTICE, "UDP commands on :%d",
+				       g.cmd_port);
+			}
+		}
+	}
+
 	logmsg(LOG_NOTICE,
 	       "teleop on :%d, %d Hz, deadman %d ms, forwarding %s",
 	       g.port, g.rate_hz, g.timeout_ms,
@@ -524,6 +620,11 @@ int main(int argc, char **argv)
 		pfd[np].fd = lfd;
 		pfd[np].events = POLLIN;
 		pfd[np++].revents = 0;
+		if (cfd >= 0) {
+			pfd[np].fd = cfd;
+			pfd[np].events = POLLIN;
+			pfd[np++].revents = 0;
+		}
 		for (i = 0; i < ncl; i++) {
 			pfd[np].fd = cl[i].fd;
 			pfd[np].events = POLLIN;
@@ -541,8 +642,16 @@ int main(int argc, char **argv)
 		if (pfd[0].revents & POLLIN)
 			client_accept(lfd);
 
+		if (cfd >= 0 && (pfd[1].revents & POLLIN)) {
+			uint8_t buf[64];
+			ssize_t n;
+
+			while ((n = recv(cfd, buf, sizeof(buf), 0)) > 0)
+				handle_udp_cmd(buf, (size_t)n);
+		}
+
 		for (i = ncl - 1; i >= 0; i--) {
-			int slot = 1 + i;
+			int slot = (cfd >= 0 ? 2 : 1) + i;
 
 			if (slot >= np)
 				continue;
@@ -589,6 +698,8 @@ int main(int argc, char **argv)
 		client_drop(0);
 	if (usock >= 0)
 		close(usock);
+	if (cfd >= 0)
+		close(cfd);
 	close(lfd);
 	return 0;
 }

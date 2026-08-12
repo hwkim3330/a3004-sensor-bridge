@@ -83,6 +83,32 @@ that a sender restart resets it to 1, so a receiver must treat a large backwards
 jump as a restart rather than a replay — otherwise a router reboot wedges it
 permanently. The reference receiver does this; if you write your own, do too.
 
+## The native app path
+
+A browser must use HTTP. An app does not, so `teleop` also accepts commands as
+UDP on `cmd_port` (default 7721), which removes the whole class of problems that
+came with a request per command:
+
+```
+offset size  field
+     0    4  magic "TCMD"
+     4    1  version 1
+     5    1  flags: bit0 = arm
+     6    2  reserved
+     8    4  uint32 sequence
+    12    8  4 x int16 axes, units of 1/10000
+    20    2  uint16 buttons
+    22    2  reserved
+```
+
+Both paths go through the same arming, clamping and sequence rules, so they
+cannot drift apart. A large backwards jump in the sequence is treated as a client
+restart rather than a replay, for the same reason the receiver has to do it.
+
+The client is at <https://github.com/hwkim3330/a3004-bridge-app> — it also takes
+the lidar ring as the binary UDP datagram rather than polled JSON, and plays the
+microphone through AudioTrack rather than a browser's jitter buffer.
+
 ## Setting it up
 
 ```sh
@@ -90,6 +116,7 @@ uci set teleop.control.enabled='1'
 uci set teleop.control.remote='192.168.1.100:7720'   # the machine with the loop
 uci set teleop.control.rate='20'
 uci set teleop.control.timeout='300'
+uci set teleop.control.cmd_port='7721'      # UDP commands, for the native app
 uci commit teleop && /etc/init.d/teleop start
 ```
 

@@ -37,6 +37,12 @@ is fixed here — see `doc/DBDC.md`.
 `doc/pc-side/teleop_receiver.py` is the reference control receiver, and the
 place to look for how the second deadman is meant to work.
 
+A native tablet client lives at
+<https://github.com/hwkim3330/a3004-bridge-app>. The web dashboard does the same
+job in a browser; the app exists because control over UDP, the ring as a binary
+datagram, and AudioTrack instead of a browser jitter buffer are all measurably
+better, and because a tab cannot promise to disarm when it loses focus.
+
 ## Tests
 
 There is no lidar, no vehicle and no RC receiver on the bench, so everything

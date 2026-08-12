@@ -25,6 +25,7 @@ import time
 BIN = os.environ.get("TELEOP_BIN", "./teleop")
 HTTP_PORT = 26830
 UDP_PORT = 26720
+CMD_PORT = 26721
 RATE = 20
 TIMEOUT_MS = 300
 
@@ -60,7 +61,8 @@ def main():
 
     proc = subprocess.Popen(
         [BIN, "-f", "-p", str(HTTP_PORT), "-r", f"127.0.0.1:{UDP_PORT}",
-         "-H", str(RATE), "-t", str(TIMEOUT_MS), "-S", status],
+         "-H", str(RATE), "-t", str(TIMEOUT_MS), "-S", status,
+         "-c", str(CMD_PORT)],
         stderr=subprocess.PIPE, text=True)
     time.sleep(0.7)
     if proc.poll() is not None:
@@ -199,6 +201,60 @@ def main():
         time.sleep(0.15)
         check("malformed counted", st()["malformed"] >= before + 2, True)
         check("still disarmed", st()["armed"], False)
+
+        # ---- 7b. the UDP command path a native app uses ----
+        # A browser must use HTTP; an app should not have to, and UDP avoids the
+        # connection-limit and keep-alive problems that path already hit once.
+        print("\n--- udp commands ---")
+        ctx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        def ucmd(arm, a0, a1, s_):
+            pkt = b"TCMD" + bytes([1, 1 if arm else 0, 0, 0])
+            pkt += struct.pack("<I", s_)
+            pkt += struct.pack("<4h", a0, a1, 0, 0)
+            pkt += struct.pack("<H", 0) + b"\0\0"
+            ctx.sendto(pkt, ("127.0.0.1", CMD_PORT))
+
+        useq = 500000
+        for _ in range(6):
+            useq += 1
+            ucmd(True, -6000, 4500, useq)
+            time.sleep(0.03)
+        time.sleep(0.15)
+        s5 = st()
+        check("udp armed", s5["armed"], True)
+        check("udp axis0", s5["axes"][0], -0.6)
+        check("udp axis1", s5["axes"][1], 0.45)
+        check("udp commands counted", s5["udp_commands"] >= 6, True)
+
+        flush()
+        time.sleep(0.12)
+        f = [x for x in drain(3) if x["armed"]]
+        check("udp reaches the wire", f[0]["axes"][0], -0.6)
+
+        # A short packet must be rejected, not half-applied. Re-send a fresh
+        # command first: the deadman is 300 ms and the drain above spends most
+        # of it, so without this the check measures the deadman instead.
+        useq += 1
+        ucmd(True, -6000, 4500, useq)
+        time.sleep(0.08)
+        before = st()["udp_malformed"]
+        ctx.sendto(b"TCMD\x01\x01\x00\x00", ("127.0.0.1", CMD_PORT))
+        time.sleep(0.10)
+        s6 = st()
+        check("truncated udp rejected", s6["udp_malformed"] >= before + 1, True)
+        check("axes unchanged", s6["axes"][0], -0.6)
+
+        # a restarted app resets its sequence; it must not be locked out
+        ucmd(True, 1000, 0, 3)
+        time.sleep(0.15)
+        check("udp client restart accepted", st()["axes"][0], 0.1)
+
+        useq += 1
+        ucmd(False, 0, 0, useq + 100000)
+        time.sleep(0.12)
+        check("udp disarm", st()["armed"], False)
+        ctx.close()
 
         # ---- 8. a final neutral frame on shutdown ----
         print("\n--- shutdown ---")
