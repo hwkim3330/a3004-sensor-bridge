@@ -9,6 +9,9 @@ trade. Everything that is userspace can be found here in a couple of minutes.
 
 ```sh
 python3 run-emu.py                 # one boot, run the checks
+python3 run-emu.py --radios 2      # plus the two-radio config path
+python3 run-emu.py --camera        # plus a real UVC camera off this host
+python3 run-emu.py --all           # everything this host can currently offer
 python3 run-emu.py --loop 5        # repeat, to catch init-ordering flakiness
 python3 run-emu.py --shell         # interactive console, ctrl-a x to leave
 python3 run-emu.py -v              # stream the guest console
@@ -21,8 +24,16 @@ cat > .config <<'EOF'
 CONFIG_TARGET_malta=y
 CONFIG_TARGET_malta_le=y
 CONFIG_TARGET_malta_le_DEVICE_default=y
+CONFIG_PACKAGE_ip-full=y
 CONFIG_PACKAGE_a3004-sensorkit=y
 CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_kmod-can-vcan=y
+CONFIG_PACKAGE_kmod-mac80211-hwsim=y
+CONFIG_PACKAGE_wpad-basic-mbedtls=y
+CONFIG_PACKAGE_kmod-usb-xhci-pci=y
+CONFIG_PACKAGE_kmod-usb-ohci-pci=y
+CONFIG_PACKAGE_kmod-video-uvc=y
+CONFIG_PACKAGE_kmod-usb-audio=y
 CONFIG_TARGET_ROOTFS_INITRAMFS=y
 EOF
 make defconfig && make -j$(nproc)
@@ -50,6 +61,24 @@ targets rebuilds the kernel and not much else.
 - `first-boot-report` runs to the end
 - nothing segfaulted, OOMed or hit a kernel BUG
 
+With `--radios 2`, using `mac80211_hwsim`:
+
+- two phys exist, and the sensorkit's uci-defaults configure **both** of them.
+  This is the only way to exercise that branch: on the real board it is only
+  reached if the DBDC fix works, so without this it was untested code.
+- no "only one radio present" warning is emitted when two are there
+
+With `vcan` in the guest (always, if the module is available):
+
+- `can-up` brings a virtual interface up, `can-bridge` starts on mipsel, and a
+  `BCAN` datagram sent from the host reaches the bus through it with nothing
+  rejected. The receive direction is deliberately not checked here - see below.
+
+With `--camera`, if a UVC device is attached to this host, it is passed through
+with `usb-host` on an emulated xHCI, and the guest's own `uvcvideo` + `ustreamer`
+are made to produce a JPEG. There is no UVC device model in QEMU, so passthrough
+is the only way to make that path do real work.
+
 ## What it cannot tell you
 
 Do not let this stand in for the board:
@@ -60,6 +89,22 @@ Do not let this stand in for the board:
 - real USB, a real camera, real lidar throughput, or timing under load. There is
   no sound card either, which is why `mic-stream` logs a missing device on every
   run — expected, and the reason it now retries instead of exiting.
+
+## Two things that look like bugs and are not
+
+**`rx` stays 0 in the CAN check.** A raw CAN socket does not receive its own
+transmissions unless `CAN_RAW_RECV_OWN_MSGS` is set, so a single bridge cannot
+see the frame it injected. Setting that flag would make the relay echo its own
+injections to the network peer - a worse product for a better-looking test. The
+receive path, batching and tracked-id decoding are covered against `vcan` on the
+host in `can-bridge/test/test_bridge.py`.
+
+**`--ibus` does nothing.** QEMU really does present the device - the monitor
+shows `Product QEMU USB Serial` on `ohci.0`, and `info qtree` lists it - but
+malta's OHCI in QEMU 8.2 never enumerates it, so the guest has no `/dev/ttyUSB0`.
+The flag is kept because it may work on another machine type or QEMU version. It
+is reported, not failed: `rc-ibus` is covered byte for byte over a pty on the
+host at the same compile target, so the gap is in the bench, not the code.
 
 ## Notes for whoever edits this
 
@@ -74,7 +119,12 @@ modelling the system wrongly and blaming the system:
    reported every service as down. Output is now framed by a sentinel the command
    text cannot contain (`$((7*11))` in, `77` out), with echo turned off and the
    console widened so long lines do not wrap mid-parse.
-3. **QEMU's default guest IP is not this guest's IP.** `br-lan` is statically
+3. **A heredoc through `cmd()` wedges the shell.** Sending multi-line input broke
+   the output framing and left the shell waiting for a terminator, after which
+   every later command returned nothing. `cmd()` now asserts a single line.
+4. **Reading the same status file three times gives three instants.** `rx=0` sat
+   next to a decoded frame, which cannot both be true. One snapshot, parsed once.
+5. **QEMU's default guest IP is not this guest's IP.** `br-lan` is statically
    192.168.1.1 and never asks for DHCP, so forwards aimed at 10.0.2.15 went
    nowhere. The user network is configured for 192.168.1.0/24 and forwards are
    addressed explicitly.
@@ -85,7 +135,7 @@ packets flow. Connecting afterwards correctly gets headers and silence.
 
 ## What this exercise actually found
 
-Two real defects, which is the return on building it:
+Three real defects, which is the return on building it:
 
 - `mic-stream` exited when the capture device was absent, and procd respawned it
   immediately — a crash loop at *0 seconds since last crash*. On the router that
@@ -98,5 +148,14 @@ Two real defects, which is the return on building it:
   a lie at precisely the moment someone is trying to find out whether the sensor
   is talking.
 
-Neither would have been visible from reading the code, and both would have cost
-bench time.
+- `can-up` could not work on the router at all. It configures the interface with
+  `ip link set ... type can bitrate ...`, and BusyBox's `ip` rejects that
+  outright with *"either dev is duplicate, or type is garbage"*. `can-bridge` now
+  depends on `ip-full`, `can-up` checks for a capable `ip` and says which package
+  to install, and a virtual interface skips the bitrate step entirely - which
+  also means `can-bridge` can be exercised against `vcan` on the router itself.
+  Note that `ip-full` is a non-default variant, so it has to be selected
+  explicitly or the build stops at `package/install`; `BRINGUP.md` says so.
+
+None of the three would have been visible from reading the code, and all three
+would have cost bench time.

@@ -15,6 +15,7 @@ CONFIG_TARGET_ramips_mt7621_DEVICE_iptime_a3004ns-m=y
 CONFIG_PACKAGE_kmod-video-core=y
 CONFIG_PACKAGE_kmod-video-uvc=y
 CONFIG_PACKAGE_kmod-usb-audio=y
+CONFIG_PACKAGE_ip-full=y
 CONFIG_PACKAGE_a3004-sensorkit=y
 CONFIG_PACKAGE_luci=y
 CONFIG_PACKAGE_luci-app-ustreamer=y
@@ -27,6 +28,14 @@ make -j$(nproc)
 Build host needs GNU awk, not mawk (`apt install gawk`) — mawk silently breaks
 the feed metadata scan with `function asort never defined`, and the symptom is
 feed packages appearing not to exist.
+
+`ip-full` is listed because BusyBox's `ip` cannot configure a CAN link at all -
+it answers `type is garbage` - and `ip-full` is a non-default variant of
+iproute2, so a `+ip-full` dependency does not pull it in by itself. Leave it out
+and the build stops at `package/install` with
+`ip-full (no such package): required by: can-bridge[ip-full]`, which is at least
+loud. This was found by booting the image under QEMU; from reading the script it
+looked fine.
 
 `kmod-video-core` and `kmod-usb-audio` are listed explicitly on purpose.
 OpenWrt's metadata generator turns some kmod dependencies into a plain

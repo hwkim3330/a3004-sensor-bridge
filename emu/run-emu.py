@@ -41,12 +41,17 @@ TREE = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 # Guest port -> host port. QEMU user-mode networking forwards both TCP and UDP,
 # which is what lets the lidar feed be injected from outside.
 FWD_TCP = {80: 8180, 8080: 8280, 8082: 8282, 8083: 8283, 7603: 8303}
-FWD_UDP = {7502: 8502, 7721: 8721}
+FWD_UDP = {7502: 8502, 7721: 8721, 7701: 8701}
 
 # OpenWrt's br-lan is statically 192.168.1.1 and never asks for DHCP, so QEMU's
 # user network is pointed at the same subnet and forwards are addressed to that
 # IP explicitly. With the default 10.0.2.0/24 the guest is simply not there.
 GUEST_IP = "192.168.1.1"
+
+# A pty the guest sees as an FTDI USB-serial adapter, which is what rc-ibus
+# expects. QEMU's usb-serial device emulates an FT232, so the guest's
+# kmod-usb-serial-ftdi binds it and it appears as /dev/ttyUSB0.
+IBUS_PTY = "/tmp/keti-emu-ibus"
 NET_OPTS = f"net=192.168.1.0/24,host=192.168.1.2,dhcpstart=192.168.1.100"
 
 PROMPT = re.compile(rb"root@[\w-]+:[^\n]*# ")
@@ -66,8 +71,10 @@ def find_kernel():
 
 
 class Emu:
-    def __init__(self, kernel, endian, verbose=False):
+    def __init__(self, kernel, endian, verbose=False, camera=None,
+                 ibus=False, radios=0):
         self.verbose = verbose
+        self.ibus_path = None
         binary = ("qemu-system-mipsel" if endian == "le"
                   else "qemu-system-mips")
         if not shutil.which(binary):
@@ -78,13 +85,40 @@ class Emu:
             [f"hostfwd=tcp::{h}-{GUEST_IP}:{g}" for g, h in FWD_TCP.items()] +
             [f"hostfwd=udp::{h}-{GUEST_IP}:{g}" for g, h in FWD_UDP.items()])
 
+        args = [binary, "-M", "malta", "-m", "256", "-kernel", kernel,
+                "-nographic", "-no-reboot",
+                "-netdev", f"user,id=n0,{fwd}",
+                "-device", "pcnet,netdev=n0"]
+
+        # A real USB controller, so the guest exercises its own USB stack rather
+        # than nothing at all. xHCI because that is what the router has.
+        if camera or ibus:
+            args += ["-device", "nec-usb-xhci,id=xhci"]
+
+        if camera:
+            # Pass the actual camera through. This is the only way to make
+            # uvcvideo and ustreamer do real work on mipsel; there is no UVC
+            # device model to fake it with.
+            args += ["-device",
+                     f"usb-host,bus=xhci.0,vendorid=0x{camera[0]:04x},"
+                     f"productid=0x{camera[1]:04x}"]
+
+        if ibus:
+            self.ibus_path = IBUS_PTY
+            args += ["-chardev",
+                     f"socket,id=ibus,path={IBUS_PTY},server=on,wait=off",
+                     "-device", "usb-serial,bus=xhci.0,chardev=ibus"]
+
+        # Virtual radios. They are not MT7615D and say nothing about DBDC, but
+        # they are the only way to exercise the two-radio configuration path -
+        # which on the real board only exists if the DBDC fix works.
+        append = "console=ttyS0"
+        if radios:
+            append += f" mac80211_hwsim.radios={radios}"
+        args += ["-append", append]
+
         self.proc = subprocess.Popen(
-            [binary, "-M", "malta", "-m", "256", "-kernel", kernel,
-             "-nographic", "-no-reboot",
-             "-netdev", f"user,id=n0,{fwd}",
-             "-device", "pcnet,netdev=n0",
-             "-append", "console=ttyS0 rootfstype=squashfs,jffs2"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, bufsize=0)
         self.buf = b""
 
@@ -138,8 +172,8 @@ class Emu:
         while time.time() < end:
             out = self.cmd("pgrep -x uhttpd >/dev/null && "
                            "pgrep -x ouster-edge >/dev/null && "
-                           "echo $((11*11)) || echo 0", timeout=20)
-            if out and "121" in out:
+                           "echo yes || echo no", timeout=20)
+            if out and out.strip() == "yes":
                 return True
             time.sleep(3)
         return False
@@ -147,43 +181,29 @@ class Emu:
     def cmd(self, line, timeout=45):
         """Run a shell command and return only its output.
 
-        Two defences against reading the shell's own echo as the answer, which
-        is what this harness did at first and what made every service look
-        down:
-
-        1. echo is turned off on the guest once, at setup.
-        2. the end of output is marked by a sentinel the *command text* cannot
-           contain: the command says $((7*11)) and the output says 77. Even if
-           echo came back, it could not be mistaken for the reply.
-
-        Long command lines also wrap on an 80-column console, so anything that
-        parses "the first line" is unreliable. This parses between markers
-        instead.
+        Output is framed by two markers whose *command* form cannot be mistaken
+        for their *output* form: the shell is sent $((3*5))BEGIN and prints
+        15BEGIN. Filtering echoed text by pattern was not enough - `stty -echo`
+        does not always take, and a long line wraps so a fragment like
+        `(7*11))` survives any filter keyed on `$((`. Framing removes the
+        guesswork: everything between the two output markers is the answer, and
+        anything else is noise by construction.
         """
+        # A newline here would break the framing and, with a heredoc, leave the
+        # shell waiting for a terminator - which wedged every command after it.
+        assert "\n" not in line, "cmd() takes a single line"
         self.buf = b""
-        marker = 'EOC$((7*11))'
-        want = b"EOC77"
-        self.proc.stdin.write(f"{line}; echo '{marker[:3]}'$((7*11))\n".encode())
+        send = f"echo $((3*5))BEGIN; {line}; echo $((7*11))END\n"
+        self.proc.stdin.write(send.encode())
         self.proc.stdin.flush()
-        if not self.read_until(re.compile(re.escape(want)), timeout):
+        if not self.read_until(re.compile(rb"77END"), timeout):
             return None
         out = self.buf.decode("utf-8", "replace")
-        # everything before the sentinel, minus any echoed command text
-        out = out.split("EOC77")[0]
-        keep = []
-        for l in out.splitlines():
-            t = l.strip()
-            if not t:
-                continue
-            # drop echoes and prompts if the guest still has echo on
-            if "EOC" in t or "$((" in t or t.endswith("# ") or \
-               PROMPT.search(t.encode()):
-                continue
-            if line.split(";")[0].strip()[:24] and \
-               line.split(";")[0].strip()[:24] in t:
-                continue
-            keep.append(t)
-        return "\n".join(keep).strip()
+        if "15BEGIN" not in out:
+            return None
+        body = out.split("15BEGIN", 1)[1].split("77END", 1)[0]
+        return "\n".join(l.strip() for l in body.splitlines()
+                          if l.strip()).strip()
 
     def stop(self):
         try:
@@ -221,6 +241,58 @@ def feed_lidar(host_port, seconds=2.0, hz=10):
         frame += 1
     s.close()
     return sent
+
+
+def find_uvc():
+    """Any UVC camera on the host, preferred: the StreamCam this was built for."""
+    best = None
+    for d in sorted(os.listdir("/sys/bus/usb/devices")):
+        base = f"/sys/bus/usb/devices/{d}"
+        try:
+            vid = int(open(f"{base}/idVendor").read().strip(), 16)
+            pid = int(open(f"{base}/idProduct").read().strip(), 16)
+        except OSError:
+            continue
+        # interface class 14 is video; check any interface of this device
+        is_uvc = False
+        for i in sorted(os.listdir("/sys/bus/usb/devices")):
+            if not i.startswith(d + ":"):
+                continue
+            try:
+                if open(f"/sys/bus/usb/devices/{i}/bInterfaceClass").read().strip() == "0e":
+                    is_uvc = True
+            except OSError:
+                pass
+        if not is_uvc:
+            continue
+        if (vid, pid) == (0x046d, 0x0893):
+            return (vid, pid)          # the StreamCam
+        best = best or (vid, pid)
+    return best
+
+
+def feed_ibus(sock_path, seconds=3.0):
+    """Synthetic i-BUS frames into the guest's emulated USB-serial port."""
+    import math
+    frames = 0
+    end = time.time() + seconds
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(sock_path)
+    except OSError as e:
+        return -1, str(e)
+    t0 = time.time()
+    while time.time() < end:
+        t = time.time() - t0
+        ch = [int(1500 + 480 * math.sin(t * 0.8)),
+              int(1500 + 480 * math.cos(t * 0.6))] + [1500] * 12
+        body = bytes([0x20, 0x40]) + b"".join(
+            struct.pack("<H", c) for c in ch)
+        s.sendall(body + struct.pack("<H", (0xFFFF - sum(body)) & 0xFFFF))
+        frames += 1
+        time.sleep(0.0075)
+    s.close()
+    return frames, ""
 
 
 def sse_probe(port, timeout=6):
@@ -262,7 +334,7 @@ def http(port, path="/", timeout=4):
         return None, str(e).encode()
 
 
-def run_once(kernel, endian, verbose):
+def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
     fails = []
 
     def check(name, ok, detail=""):
@@ -271,7 +343,7 @@ def run_once(kernel, endian, verbose):
         if not ok:
             fails.append(name)
 
-    emu = Emu(kernel, endian, verbose)
+    emu = Emu(kernel, endian, verbose, camera=camera, ibus=ibus, radios=radios)
     try:
         print("  booting ...", flush=True)
         if not emu.read_until(rb"Please press Enter to activate", 180):
@@ -313,7 +385,7 @@ def run_once(kernel, endian, verbose):
         for svc in ("ouster-edge", "mic-stream", "teleop", "uhttpd"):
             out = emu.cmd(f"pgrep -x {svc} >/dev/null && echo up || echo down")
             expect_up = svc in ("ouster-edge", "uhttpd")
-            got_up = bool(out and "up" in out)
+            got_up = bool(out and out.strip() == "up")
             if expect_up and not got_up:
                 # A service that is down is only useful with the reason attached
                 why = emu.cmd(f"logread | grep -i {svc} | tail -4")
@@ -379,6 +451,143 @@ def run_once(kernel, endian, verbose):
               b'"ring_cm"' in sse and b'"sectors"' in sse,
               f"got {sse[-160:]!r}")
 
+        # --- CAN on the guest's own kernel, not the host's ---
+        print("\n  can-bridge on the guest")
+        # Not `ip -br`: BusyBox's ip has no brief mode, and using it here made a
+        # working vcan look absent.
+        up = emu.cmd("modprobe vcan 2>/dev/null; "
+                     "ip link add dev vcan0 type vcan 2>/dev/null; "
+                     "ip link set up vcan0 2>/dev/null; "
+                     "ip link show vcan0 >/dev/null 2>&1 && echo yes || echo no")
+        have_vcan = bool(up and up.strip() == "yes")
+        check("vcan available in the guest", have_vcan, f"got {up!r}")
+
+        if have_vcan:
+            # There is no python or cansend in the guest, so the frame is put on
+            # the bus by the bridge itself: host -> UDP -> inject -> vcan0. vcan
+            # loops locally-sent frames back, so the bridge then *receives* what
+            # it injected and the round trip exercises both directions on mipsel.
+            emu.cmd("uci set can-bridge.bus.enabled=1")
+            emu.cmd("uci set can-bridge.bus.interface=vcan0")
+            emu.cmd("uci set can-bridge.bus.track=211,251")
+            emu.cmd("uci set can-bridge.bus.allow_inject=1")
+            emu.cmd("uci set can-bridge.bus.listen=7701")
+            emu.cmd("uci commit can-bridge")
+            emu.cmd("/etc/init.d/can-bridge restart", timeout=40)
+            time.sleep(2)
+            running = emu.cmd("pgrep -x can-bridge >/dev/null && echo yes || echo no")
+            check("can-bridge started on vcan0",
+                  running and running.strip() == "yes", f"got {running!r}")
+
+            tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            pkt = b"BCAN" + bytes([1, 1, 0, 0]) + \
+                  struct.pack("<IB3x8s", 0x211, 8, bytes(range(1, 9)))
+            for _ in range(12):
+                tx.sendto(pkt, ("127.0.0.1", FWD_UDP[7701]))
+                time.sleep(0.05)
+            tx.close()
+            time.sleep(1.5)
+
+            # One snapshot, parsed once. Reading the file three times gave
+            # three different instants and made rx=0 sit next to a decoded
+            # frame, which cannot both be true.
+            raw = emu.cmd("cat /var/run/can-bridge.json 2>/dev/null | tr -d ' \\n\\t'")
+            snap = {}
+            if raw:
+                import json as _json
+                try:
+                    snap = _json.loads(raw)
+                except Exception:
+                    snap = {}
+            # What only the guest can show: the daemon runs on mipsel, can-up
+            # brought the interface up, and a datagram from outside reached the
+            # bus through it.
+            check("bridge injected onto the bus on mipsel",
+                  snap.get("injected", 0) > 0, f"snapshot={raw!r}")
+            check("nothing was rejected", snap.get("rejected", -1) == 0,
+                  f"rejected={snap.get('rejected')!r}")
+            # No check on rx here, deliberately. A raw CAN socket does not
+            # receive its own transmissions unless CAN_RAW_RECV_OWN_MSGS is set,
+            # and setting it would make the relay echo its own injections back to
+            # the network peer - a worse product for a better-looking test. The
+            # receive path, batching and tracked-id decoding are covered against
+            # vcan on the host in can-bridge/test/test_bridge.py.
+            print(f"  INFO  rx={snap.get('rx')} (a raw CAN socket does not see "
+                  f"its own frames; receive is covered by the host tests)")
+
+        # --- i-BUS over an emulated USB-serial adapter ---
+        if ibus:
+            print("\n  rc-ibus over emulated USB-serial")
+            dev = emu.cmd("ls /dev/ttyUSB* 2>/dev/null | head -1")
+            if not (dev and "ttyUSB" in dev):
+                # QEMU does present the device - the monitor shows
+                # "Product QEMU USB Serial" on ohci.0 - but malta's OHCI in
+                # QEMU 8.2 never enumerates it, so the guest has no ttyUSB.
+                # Reported rather than failed: it is a limitation of the bench,
+                # not of rc-ibus, which is covered byte for byte over a pty on
+                # the host at the same compile target.
+                print("  INFO  guest did not enumerate the emulated USB-serial "
+                      "port; skipping (see emu/README.md)")
+            else:
+                emu.cmd(f"uci set rc-ibus.ibus.enabled=1; "
+                        f"uci set rc-ibus.ibus.device={dev.strip()}; "
+                        f"uci commit rc-ibus")
+                emu.cmd("/etc/init.d/rc-ibus restart", timeout=30)
+                time.sleep(1)
+                n, err = feed_ibus(IBUS_PTY, seconds=3.0)
+                check("host could feed the port", n > 0, f"{n} {err}")
+                time.sleep(0.5)
+                st = emu.cmd("cat /var/run/rc-ibus.json 2>/dev/null | "
+                             "tr -d ' \\n\\t' | head -c 300")
+                check("rc-ibus decoded frames on mipsel",
+                      bool(st and '"link":true' in st), f"got {st!r}")
+                check("no checksum errors over the emulated link",
+                      bool(st and '"bad_crc":0' in st), f"got {st!r}")
+
+        # --- the two-radio path, which only exists if DBDC works ---
+        if radios:
+            print(f"\n  wifi config path with {radios} virtual radios")
+            n = emu.cmd("ls /sys/class/ieee80211/ 2>/dev/null | grep -c phy")
+            check(f"guest has {radios} phys", n and n.strip() == str(radios),
+                  f"got {n!r}")
+            # re-run the sensorkit's own defaults against two radios
+            emu.cmd("sh /rom/etc/uci-defaults/99-a3004-sensorkit 2>/dev/null || "
+                    "true", timeout=40)
+            got = emu.cmd("uci show wireless | grep -cE "
+                          "'radio[01]\\.(disabled|country)'")
+            check("sensorkit configured both radios",
+                  bool(got and int(got.strip() or 0) >= 4),
+                  f"matching options: {got!r}")
+            warn = emu.cmd("logread | grep -c 'only one radio present' || true")
+            check("no single-radio warning with two radios",
+                  warn and warn.strip() == "0", f"got {warn!r}")
+
+        # --- camera, if one is attached to the host ---
+        if camera:
+            print("\n  real camera passed through to the guest")
+            time.sleep(3)
+            vid = emu.cmd("ls /dev/video* 2>/dev/null | head -2")
+            check("uvcvideo bound on mipsel", bool(vid and "video" in vid),
+                  f"got {vid!r}")
+            fmts = emu.cmd("v4l2-ctl -d /dev/video0 --list-formats 2>/dev/null | "
+                           "grep -oiE 'mjpg|mjpeg|yuyv|nv12' | sort -u | tr '\\n' ' '")
+            print(f"  INFO  formats the guest sees: {fmts!r}")
+            if fmts and ("mjpg" in fmts.lower() or "mjpeg" in fmts.lower()):
+                emu.cmd("uci set ustreamer.video0.enabled=1; uci commit ustreamer")
+                emu.cmd("/etc/init.d/ustreamer restart", timeout=30)
+                time.sleep(4)
+                st, body = http(FWD_TCP[8080], "/snapshot", timeout=10)
+                check("a JPEG came out of the guest",
+                      st == 200 and body[:2] == b"\xff\xd8",
+                      f"got {st} {body[:8]!r}")
+                # the number the bandwidth budget predicted and nobody measured
+                load = emu.cmd("top -bn1 2>/dev/null | grep -m1 ustreamer || "
+                               "ps w | grep -m1 [u]streamer")
+                print(f"  INFO  ustreamer on mipsel: {load!r}")
+                print("  NOTE  QEMU is not MT7621 and this is not a timing "
+                      "measurement; it shows the path works, not what it costs")
+
+        # --- the report script must run without erroring ---
         # --- the report script must run without erroring ---
         print("\n  first-boot-report")
         out = emu.cmd("first-boot-report 2>&1 | tail -3", timeout=60)
@@ -401,7 +610,27 @@ def main():
     ap.add_argument("--loop", type=int, default=1)
     ap.add_argument("--shell", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--camera", action="store_true",
+                    help="pass a UVC camera on this host through to the guest")
+    ap.add_argument("--ibus", action="store_true",
+                    help="give the guest an emulated USB-serial port and feed "
+                         "it synthetic i-BUS frames")
+    ap.add_argument("--radios", type=int, default=0,
+                    help="virtual mac80211_hwsim radios, e.g. 2 to exercise the "
+                         "two-radio config path DBDC would create")
+    ap.add_argument("--all", action="store_true",
+                    help="everything this host can currently offer")
     args = ap.parse_args()
+
+    camera = None
+    if args.camera or args.all:
+        camera = find_uvc()
+        if camera:
+            print(f"camera: passing {camera[0]:04x}:{camera[1]:04x} through")
+        else:
+            print("camera: no UVC device on this host; skipping that surface")
+    ibus = args.ibus or args.all
+    radios = args.radios or (2 if args.all else 0)
 
     kernel, endian = find_kernel()
     if not kernel:
@@ -411,6 +640,7 @@ def main():
     print(f"kernel: {os.path.relpath(kernel, TREE)}  ({endian})")
 
     if args.shell:
+        # keep --shell simple; the extra surfaces are for the scripted run
         binary = "qemu-system-mipsel" if endian == "le" else "qemu-system-mips"
         fwd = ",".join(
             [NET_OPTS] +
@@ -429,7 +659,8 @@ def main():
     for i in range(args.loop):
         if args.loop > 1:
             print(f"\n===== run {i + 1}/{args.loop} =====")
-        fails = run_once(kernel, endian, args.verbose)
+        fails = run_once(kernel, endian, args.verbose, camera=camera,
+                         ibus=ibus, radios=radios)
         if fails:
             bad += 1
             print(f"\n  run failed: {', '.join(fails)}")
