@@ -20,6 +20,7 @@ is fixed here — see `doc/DBDC.md`.
 | [`doc/RC-AND-WIFI.md`](doc/RC-AND-WIFI.md) | why no WiFi chip can receive FlySky AFHDS 2A, what to do instead, and how many radios and SSIDs the DBDC fix buys |
 | [`doc/TELEOP.md`](doc/TELEOP.md) | why a tablet cannot emulate a 2.4 GHz transmitter, and how it drives things over IP instead — with two independent deadmen |
 | [`doc/RING-FORMAT.md`](doc/RING-FORMAT.md) | the lidar range-ring wire format and JSON status |
+| [`doc/UPSTREAM.md`](doc/UPSTREAM.md) | the two pull requests this work becomes, in which order, and what to check before opening either |
 
 ## Packages
 
