@@ -9,14 +9,18 @@ STATUS=/var/run/ouster-edge.json
 
 append_zone() {
 	local cfg="$1"
-	local az_start az_end range
+	local az_start az_end range confirm clear_after hysteresis
 
 	config_get az_start "$cfg" az_start
 	config_get az_end "$cfg" az_end
 	config_get range "$cfg" range
+	config_get confirm "$cfg" confirm 2
+	config_get clear_after "$cfg" clear_after 2
+	config_get hysteresis "$cfg" hysteresis 0.3
 
 	[ -n "$az_start" ] && [ -n "$az_end" ] && [ -n "$range" ] || return 0
-	procd_append_param command --zone "${az_start}:${az_end}:${range}"
+	procd_append_param command --zone \
+		"${az_start}:${az_end}:${range}:${confirm}:${clear_after}:${hysteresis}"
 }
 
 start_service() {

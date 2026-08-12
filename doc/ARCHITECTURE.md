@@ -103,12 +103,16 @@ parse better. So the router forwards raw and computes only things that are
    1100 bytes, against 64 packets × 12544 B = 803 kB of raw revolution. A 730×
    reduction, and enough for obstacle presence, nearest-range and zone logic.
 4. **Reacts.** Polar zones are evaluated on **every column as it arrives**, not
-   once per revolution, so an intrusion fires within a packet — measured at
-   1.4 ms rather than the up-to-100 ms a per-revolution check would cost at
-   10 Hz. Clearing is the asymmetric half and does wait for a full clean
-   revolution, because that is what it takes to know nothing is there. A local
-   reflex on this budget is exactly the work that belongs on the node next to
-   the sensor rather than a machine across a WiFi link.
+   once per revolution, so an intrusion fires within a packet — milliseconds
+   rather than the up-to-100 ms a per-revolution check would cost at 10 Hz.
+   A zone needs a configurable number of columns to agree before firing, because
+   a reflex that false-alarms on one dust return gets switched off by whoever
+   works next to it, and a disabled reflex is worse than a slightly slower one.
+   Releasing is the asymmetric half: it takes several quiet revolutions plus a
+   range margin, since one quiet rotation is not proof and an object parked on
+   the boundary must not chatter. A local reflex on this budget is exactly the
+   work that belongs on the node next to the sensor rather than a machine across
+   a WiFi link.
 5. **Relays.** The raw stream is forwarded verbatim to a real machine when one
    is present, so nothing is lost by putting the router in the path.
 6. **Reads RC input**, if a FlySky receiver's i-BUS output is wired to a

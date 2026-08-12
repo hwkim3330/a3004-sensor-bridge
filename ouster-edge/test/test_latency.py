@@ -29,7 +29,8 @@ BIN = os.environ.get("OUSTER_EDGE_BIN", "./ouster-edge")
 CH, COLS, WIDTH, SECTORS = 64, 16, 1024, 360
 PORT, SSE_PORT = 26532, 26603
 FAR, NEAR = 30000, 1500          # mm
-ZONE = "0:20:5.0"                # 0-20 deg, 5 m
+ZONE = "0:20:5.0:1:1:0"          # 0-20 deg, 5 m, fire on one column
+                                 # (confirm=1) so this measures the reflex path
 
 
 def px(r):

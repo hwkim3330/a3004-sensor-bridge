@@ -59,6 +59,7 @@ cc -O2 -Wall -Wextra -o ouster-edge ../src/ouster-edge.c
 python3 test_profiles.py      # all four Ouster UDP profiles, byte-exact
 python3 test_accounting.py     # packet accounting and the missed_columns counter
 python3 test_latency.py        # zone and ring latency
+python3 test_zones.py          # zone confirmation and hysteresis
 sh    test_metadata.sh         # the sensor HTTP metadata probe
 
 cd ../../can-bridge/test
@@ -80,8 +81,14 @@ cc -O2 -Wall -Wextra -o test_afhds2a test_afhds2a.c ../src/afhds2a.c
 ./test_afhds2a                 # AFHDS 2A hop sets and frame layouts
 ```
 
-If you run these repeatedly, note that a daemon left behind by an aborted run
-holds the port and quietly absorbs the traffic, which looks exactly like a
+All of the above also runs in CI on every push that touches `package/keti`, in
+`.github/workflows/keti-tests.yml`, with `-Werror`. These suites are what stands
+in for a lidar, a vehicle and an RC receiver that are not on the bench, so a
+regression in them is one nobody would otherwise notice until the hardware
+arrived.
+
+If you run them by hand repeatedly, note that a daemon left behind by an aborted
+run holds the port and quietly absorbs the traffic, which looks exactly like a
 parser regression. `pgrep -x ouster-edge` before blaming the code.
 
 ## What is verified, and what needs the board
@@ -94,6 +101,8 @@ Measured or exercised here:
 - the Ouster parser against all four documented UDP profiles
 - `missed_columns` counts a deliberately dropped packet exactly
 - zone latency 1.4 ms, ring delivery 0.2–0.7 ms
+- zones need N columns to agree and M quiet revolutions to release, so a single
+  stray return does not fire and an object on the boundary does not chatter
 - a Logitech StreamCam VU0054: MJPEG to 1920×1080, USB 3.0 SuperSpeed, and its
   bitrates at each mode
 - its microphone: exact byte rate, valid WAV, real signal

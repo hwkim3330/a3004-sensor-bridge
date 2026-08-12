@@ -81,7 +81,15 @@ struct zone {
 	int az_start_mdeg;	/* millidegrees, [0, 360000) */
 	int az_end_mdeg;	/* may wrap past 360000 */
 	uint32_t max_range_mm;
+	uint32_t hyst_mm;	/* clearing needs range above max + this */
+	int confirm;		/* columns needed in one revolution to fire */
+	int clear_after;	/* clean revolutions needed to release */
 	bool active;
+
+	/* per-revolution and across-revolution counters */
+	int hits;
+	int clean_revs;
+	uint64_t enters;
 };
 
 struct stats {
@@ -329,18 +337,35 @@ static void zones_column(int sector, uint32_t range_mm)
 		return;
 
 	for (z = 0; z < g.nzones; z++) {
+		struct zone *zn = &g.zones[z];
+
 		if (!(mask & (1u << z)))
 			continue;
-		if (range_mm > g.zones[z].max_range_mm)
+
+		/* An active zone releases only once the range clears the
+		 * threshold *plus* a margin, so an object sitting exactly on the
+		 * boundary does not chatter at the revolution rate. */
+		if (range_mm > zn->max_range_mm +
+			       (zn->active ? zn->hyst_mm : 0))
 			continue;
 
-		g.zone_hit |= (uint16_t)(1u << z);
+		zn->hits++;
+		if (zn->hits < zn->confirm)
+			continue;	/* not enough agreement yet */
 
-		if (!g.zones[z].active) {
-			g.zones[z].active = true;
-			logmsg(LOG_NOTICE, "zone %d ENTERED", z);
+		g.zone_hit |= (uint16_t)(1u << z);
+		zn->clean_revs = 0;
+
+		if (!zn->active) {
+			zn->active = true;
+			zn->enters++;
+			logmsg(LOG_NOTICE,
+			       "zone %d ENTERED (%d columns, threshold %d)",
+			       z, zn->hits, zn->confirm);
 		}
-		/* Rising edge fires as soon as one intruding column lands. */
+		/* Fires as soon as enough columns agree, which is still inside
+		 * one revolution - measured at a few milliseconds, not the
+		 * ~100 ms a per-revolution design would cost. */
 		if (!g.zone_alarm) {
 			g.zone_alarm = true;
 			run_action("alarm");
@@ -354,16 +379,31 @@ static void zones_column(int sector, uint32_t range_mm)
  */
 static void zones_revolution_end(void)
 {
+	bool any_active = false;
 	int z;
 
 	for (z = 0; z < g.nzones; z++) {
-		if (g.zones[z].active && !(g.zone_hit & (1u << z))) {
-			g.zones[z].active = false;
-			logmsg(LOG_NOTICE, "zone %d clear", z);
+		struct zone *zn = &g.zones[z];
+
+		if (zn->active && !(g.zone_hit & (1u << z))) {
+			/* One quiet revolution is not proof: a partly occluded
+			 * object, or one at the edge of the selected elevation
+			 * band, drops out for a rotation and comes back. */
+			if (++zn->clean_revs >= zn->clear_after) {
+				zn->active = false;
+				logmsg(LOG_NOTICE, "zone %d clear after %d quiet revolutions",
+				       z, zn->clean_revs);
+			}
 		}
+		zn->hits = 0;
+		if (zn->active)
+			any_active = true;
 	}
 
-	if (g.zone_alarm && !g.zone_hit) {
+	/* The aggregate alarm follows the zones rather than the current
+	 * revolution's hits, so it inherits their hysteresis instead of
+	 * releasing a revolution early. */
+	if (g.zone_alarm && !any_active) {
 		g.zone_alarm = false;
 		run_action("clear");
 	}
@@ -559,6 +599,11 @@ static void status_write(void)
 		fprintf(f, "%s%s", z ? ", " : "",
 			g.zones[z].active ? "true" : "false");
 	fprintf(f, "],\n");
+	fprintf(f, "\t\"zone_enters\": [");
+	for (z = 0; z < g.nzones; z++)
+		fprintf(f, "%s%llu", z ? ", " : "",
+			(unsigned long long)g.zones[z].enters);
+	fprintf(f, "],\n");
 
 	/* The ring goes into the status file as well, so the on-router
 	 * dashboard can render it straight from HTTP - a browser cannot read
@@ -701,18 +746,42 @@ static bool parse_hostport(const char *s, struct sockaddr_in *out, int defport)
 	return inet_pton(AF_INET, buf, &out->sin_addr) == 1;
 }
 
+/*
+ * "az_start:az_end:range[:confirm[:clear_after[:hysteresis]]]"
+ *
+ * confirm and clear_after default to 2 rather than 1 deliberately. Firing on a
+ * single column is the safe direction in isolation, but a reflex that false
+ * alarms on one dust return gets switched off by whoever has to work next to
+ * it, and a disabled reflex is worse than a slightly slower one.
+ */
 static bool parse_zone(const char *s)
 {
 	double a0, a1;
-	double range_m;
+	double range_m, hyst_m = 0.3;
+	int confirm = 2, clear_after = 2;
 	struct zone *z;
+	int n;
 
 	if (g.nzones >= MAX_ZONES)
 		return false;
-	if (sscanf(s, "%lf:%lf:%lf", &a0, &a1, &range_m) != 3)
+	n = sscanf(s, "%lf:%lf:%lf:%d:%d:%lf", &a0, &a1, &range_m,
+		   &confirm, &clear_after, &hyst_m);
+	if (n < 3)
 		return false;
+	if (confirm < 1)
+		confirm = 1;
+	if (clear_after < 1)
+		clear_after = 1;
+	if (hyst_m < 0)
+		hyst_m = 0;
 
 	z = &g.zones[g.nzones++];
+	z->confirm = confirm;
+	z->clear_after = clear_after;
+	z->hyst_mm = (uint32_t)(hyst_m * 1000.0);
+	z->hits = 0;
+	z->clean_revs = 0;
+	z->enters = 0;
 	z->az_start_mdeg = (int)(a0 * 1000.0);
 	z->az_end_mdeg = (int)(a1 * 1000.0);
 	if (z->az_end_mdeg < z->az_start_mdeg)
@@ -736,7 +805,12 @@ static void usage(const char *argv0)
 "  -M, --max-range M        ignore returns further than this (default 200)\n"
 "  -r, --relay HOST[:PORT]  forward every raw packet here (default port 7502)\n"
 "  -o, --ring HOST[:PORT]   send the derived ring here (default port 7602)\n"
-"  -z, --zone A0:A1:R       polar zone, degrees:degrees:metres (repeatable)\n"
+"  -z, --zone SPEC          polar zone, repeatable. SPEC is\n"
+"                           az_start:az_end:range[:confirm[:clear_after[:hyst]]]\n"
+"                           degrees:degrees:metres, then how many columns must\n"
+"                           agree (default 2), how many quiet revolutions\n"
+"                           release it (2), and the release margin in metres\n"
+"                           (0.3)\n"
 "  -a, --action CMD         run 'CMD alarm' / 'CMD clear' on zone changes\n"
 "  -S, --status PATH        JSON status file (default /var/run/ouster-edge.json)\n"
 "  -I, --status-interval MS  how often to rewrite the status file (default 200)\n"
