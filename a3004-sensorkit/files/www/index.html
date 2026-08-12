@@ -18,8 +18,12 @@
 	--accent: #60a5fa;
 }
 * { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; }
+html { height: 100%; }
 body {
+	height: 100dvh;
+	min-height: 100%;
+	margin: 0;
+	overflow: hidden;
 	background: var(--bg);
 	color: var(--fg);
 	font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Noto Sans KR", sans-serif;
@@ -68,7 +72,7 @@ main {
 	display: flex;
 	flex-direction: column;
 	overflow: hidden;
-	min-height: 240px;
+	min-height: 0;
 }
 .card > h2 {
 	font-size: 12px;
@@ -90,7 +94,11 @@ main {
 	object-fit: contain;
 	background: #000;
 	display: block;
+	/* until a frame decodes, an <img> with a dead src shows a broken-image
+	   glyph; hide it rather than let that be the first thing on screen */
+	visibility: hidden;
 }
+#cam.live { visibility: visible; }
 #camMsg {
 	position: absolute; inset: 0;
 	display: flex; align-items: center; justify-content: center;
@@ -110,14 +118,14 @@ main {
 .stats {
 	flex: none;
 	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+	grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
 	gap: 1px;
 	background: var(--edge);
 	border-top: 1px solid var(--edge);
 }
-.stat { background: var(--panel); padding: 8px 12px; }
+.stat { background: var(--panel); padding: 7px 10px; min-width: 0; }
 .stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); }
-.stat .v { font-size: 16px; font-variant-numeric: tabular-nums; }
+.stat .v { font-size: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .stat .v.warn { color: var(--warn); }
 .stat .v.bad { color: var(--bad); }
 
@@ -209,11 +217,13 @@ function camConnect() {
 }
 
 el("cam").addEventListener("load", function () {
+	this.classList.add("live");
 	el("camMsg").style.display = "none";
 	el("camLabel").textContent = this.naturalWidth + "x" + this.naturalHeight;
 });
 
 el("cam").addEventListener("error", function () {
+	this.classList.remove("live");
 	el("camMsg").style.display = "flex";
 	el("camMsgText").innerHTML =
 		"카메라 스트림이 없습니다.<br><br>" +
