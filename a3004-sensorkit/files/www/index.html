@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0e13">
+<title>A3004NS-M Sensor Bridge</title>
+<style>
+:root {
+	--bg: #0b0e13;
+	--panel: #141922;
+	--edge: #232b38;
+	--fg: #e6ecf5;
+	--dim: #8695ab;
+	--ok: #34d399;
+	--warn: #fbbf24;
+	--bad: #f87171;
+	--accent: #60a5fa;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+	background: var(--bg);
+	color: var(--fg);
+	font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Noto Sans KR", sans-serif;
+	-webkit-text-size-adjust: 100%;
+	display: flex;
+	flex-direction: column;
+}
+header {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 10px 16px;
+	border-bottom: 1px solid var(--edge);
+	background: var(--panel);
+	flex: none;
+}
+header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .2px; }
+header .sp { flex: 1; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); flex: none; }
+.dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.dot.off { background: var(--bad); }
+.pill {
+	font-size: 12px;
+	color: var(--dim);
+	border: 1px solid var(--edge);
+	border-radius: 999px;
+	padding: 3px 10px;
+	white-space: nowrap;
+}
+.pill.alarm { color: #fff; background: var(--bad); border-color: var(--bad); }
+
+main {
+	flex: 1;
+	display: grid;
+	gap: 12px;
+	padding: 12px;
+	grid-template-columns: 1fr 1fr;
+	min-height: 0;
+}
+@media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+
+.card {
+	background: var(--panel);
+	border: 1px solid var(--edge);
+	border-radius: 12px;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	min-height: 240px;
+}
+.card > h2 {
+	font-size: 12px;
+	text-transform: uppercase;
+	letter-spacing: .08em;
+	color: var(--dim);
+	margin: 0;
+	padding: 10px 14px;
+	border-bottom: 1px solid var(--edge);
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+.card > h2 .sp { flex: 1; }
+.body { flex: 1; position: relative; min-height: 0; display: flex; }
+
+#cam {
+	width: 100%; height: 100%;
+	object-fit: contain;
+	background: #000;
+	display: block;
+}
+#camMsg {
+	position: absolute; inset: 0;
+	display: flex; align-items: center; justify-content: center;
+	padding: 24px;
+	color: var(--dim); font-size: 13px;
+}
+/* the flex parent only centres; the text itself must be a block, or each
+   inline child becomes its own flex item and the message comes apart */
+#camMsg > div { text-align: center; max-width: 34em; line-height: 1.7; }
+#camMsg code {
+	font-size: 12px; color: var(--fg);
+	background: #1d2534; border-radius: 4px; padding: 1px 5px;
+	white-space: nowrap;
+}
+#lidar { width: 100%; height: 100%; display: block; touch-action: none; }
+
+.stats {
+	flex: none;
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+	gap: 1px;
+	background: var(--edge);
+	border-top: 1px solid var(--edge);
+}
+.stat { background: var(--panel); padding: 8px 12px; }
+.stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); }
+.stat .v { font-size: 16px; font-variant-numeric: tabular-nums; }
+.stat .v.warn { color: var(--warn); }
+.stat .v.bad { color: var(--bad); }
+
+.ctl {
+	flex: none;
+	display: flex; align-items: center; gap: 10px;
+	padding: 8px 14px;
+	border-top: 1px solid var(--edge);
+	font-size: 12px; color: var(--dim);
+}
+.ctl input[type=range] { flex: 1; accent-color: var(--accent); }
+button {
+	font: inherit; font-size: 12px;
+	color: var(--fg); background: #1d2534;
+	border: 1px solid var(--edge); border-radius: 7px;
+	padding: 5px 11px; cursor: pointer;
+}
+button:active { background: #263047; }
+</style>
+</head>
+<body>
+
+<header>
+	<span class="dot" id="linkDot"></span>
+	<h1>A3004NS-M Sensor Bridge</h1>
+	<span class="sp"></span>
+	<span class="pill" id="profilePill">lidar: —</span>
+	<span class="pill" id="alarmPill">zones: —</span>
+</header>
+
+<main>
+	<section class="card">
+		<h2>USB camera<span class="sp"></span><span id="camLabel">—</span></h2>
+		<div class="body">
+			<img id="cam" alt="">
+			<div id="camMsg"><div id="camMsgText">스트림 연결 중…</div></div>
+		</div>
+		<div class="ctl">
+			<button id="camReload">스트림 재연결</button>
+			<span id="camHint"></span>
+		</div>
+	</section>
+
+	<section class="card">
+		<h2>Lidar range ring<span class="sp"></span><span id="ringLabel">—</span></h2>
+		<div class="body"><canvas id="lidar"></canvas></div>
+		<div class="ctl">
+			<label for="zoom">범위</label>
+			<input type="range" id="zoom" min="2" max="100" step="1" value="30">
+			<span id="zoomLabel">30 m</span>
+		</div>
+		<div class="stats">
+			<div class="stat"><div class="k">frames/s</div><div class="v" id="sFps">—</div></div>
+			<div class="stat"><div class="k">packets/s</div><div class="v" id="sPps">—</div></div>
+			<div class="stat"><div class="k">Mbit/s</div><div class="v" id="sMbps">—</div></div>
+			<div class="stat"><div class="k">missed cols</div><div class="v" id="sMiss">—</div></div>
+			<div class="stat"><div class="k">nearest</div><div class="v" id="sNear">—</div></div>
+			<div class="stat"><div class="k">relayed</div><div class="v" id="sRelay">—</div></div>
+		</div>
+	</section>
+</main>
+
+<script>
+"use strict";
+
+var STATUS_URL = "ouster.json";
+var POLL_MS = 200;
+
+var el = function (id) { return document.getElementById(id); };
+var cv = el("lidar"), ctx = cv.getContext("2d");
+var maxRange = 30;
+var state = null;
+var prev = null, prevT = 0;
+var lastGood = 0;
+
+/* ---------- camera ---------- */
+
+function camUrl() {
+	/* ustreamer listens on :8080 on the router itself, so derive the host
+	   from wherever this page was loaded. Cache-bust on reconnect. */
+	return location.protocol + "//" + location.hostname + ":8080/stream?_=" + Date.now();
+}
+
+function camConnect() {
+	var img = el("cam");
+	el("camMsg").style.display = "flex";
+	el("camMsgText").textContent = "스트림 연결 중…";
+	img.src = camUrl();
+}
+
+el("cam").addEventListener("load", function () {
+	el("camMsg").style.display = "none";
+	el("camLabel").textContent = this.naturalWidth + "x" + this.naturalHeight;
+});
+
+el("cam").addEventListener("error", function () {
+	el("camMsg").style.display = "flex";
+	el("camMsgText").innerHTML =
+		"카메라 스트림이 없습니다.<br><br>" +
+		"<code>sensor-probe</code> 로 카메라가 MJPEG 를 내는지 확인하고<br>" +
+		"<code>/etc/init.d/ustreamer start</code> 를 실행하세요.";
+	el("camLabel").textContent = "off";
+});
+
+el("camReload").addEventListener("click", camConnect);
+el("camHint").textContent = location.hostname + ":8080";
+
+/* ---------- lidar ---------- */
+
+el("zoom").addEventListener("input", function () {
+	maxRange = +this.value;
+	el("zoomLabel").textContent = maxRange + " m";
+	draw();
+});
+
+function resize() {
+	var r = cv.getBoundingClientRect();
+	var dpr = window.devicePixelRatio || 1;
+	cv.width = Math.max(1, Math.round(r.width * dpr));
+	cv.height = Math.max(1, Math.round(r.height * dpr));
+	draw();
+}
+window.addEventListener("resize", resize);
+
+function rangeColor(m) {
+	/* near = red, far = blue, so an approaching object is obvious */
+	var t = Math.min(1, m / maxRange);
+	var h = 8 + t * 210;
+	return "hsl(" + h + ", 85%, 58%)";
+}
+
+function draw() {
+	var w = cv.width, h = cv.height;
+	var cx = w / 2, cy = h / 2;
+	var R = Math.min(w, h) * 0.46;
+	var i, n, ring, a, r, px, py, m;
+
+	ctx.clearRect(0, 0, w, h);
+	ctx.fillStyle = "#0b0e13";
+	ctx.fillRect(0, 0, w, h);
+
+	/* range rings, one per nice step */
+	var step = maxRange <= 10 ? 2 : maxRange <= 30 ? 5 : maxRange <= 60 ? 10 : 20;
+	ctx.font = (11 * (window.devicePixelRatio || 1)) + "px ui-sans-serif, sans-serif";
+	ctx.textAlign = "left";
+	for (m = step; m <= maxRange; m += step) {
+		ctx.beginPath();
+		ctx.arc(cx, cy, R * m / maxRange, 0, Math.PI * 2);
+		ctx.strokeStyle = "#1d2534";
+		ctx.lineWidth = 1;
+		ctx.stroke();
+		ctx.fillStyle = "#3d4859";
+		ctx.fillText(m + "m", cx + 4, cy - R * m / maxRange - 3);
+	}
+
+	/* cross hairs */
+	ctx.strokeStyle = "#1d2534";
+	ctx.beginPath();
+	ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
+	ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R);
+	ctx.stroke();
+
+	if (!state || !state.ring_cm) {
+		ctx.fillStyle = "#8695ab";
+		ctx.textAlign = "center";
+		ctx.fillText("lidar 데이터 없음", cx, cy + R + 22);
+		return;
+	}
+
+	ring = state.ring_cm;
+	n = ring.length;
+	var dpr = window.devicePixelRatio || 1;
+	var dotR = Math.max(1.5 * dpr, R * 2 * Math.PI / n * 0.42);
+
+	for (i = 0; i < n; i++) {
+		if (ring[i] < 0) continue;
+		m = ring[i] / 100;
+		if (m > maxRange) continue;
+		/* sector 0 points up, azimuth increases clockwise */
+		a = (i / n) * Math.PI * 2 - Math.PI / 2;
+		r = R * m / maxRange;
+		px = cx + Math.cos(a) * r;
+		py = cy + Math.sin(a) * r;
+		ctx.beginPath();
+		ctx.arc(px, py, dotR, 0, Math.PI * 2);
+		ctx.fillStyle = rangeColor(m);
+		ctx.fill();
+	}
+
+	/* sensor origin */
+	ctx.beginPath();
+	ctx.arc(cx, cy, 3 * dpr, 0, Math.PI * 2);
+	ctx.fillStyle = "#e6ecf5";
+	ctx.fill();
+}
+
+/* ---------- polling ---------- */
+
+function setStat(id, val, cls) {
+	var e = el(id);
+	e.textContent = val;
+	e.className = "v" + (cls ? " " + cls : "");
+}
+
+function onStatus(s) {
+	var now = Date.now(), dt, near, i;
+
+	lastGood = now;
+	el("linkDot").className = "dot on";
+
+	if (prev && prevT) {
+		dt = (now - prevT) / 1000;
+		if (dt > 0.05) {
+			setStat("sFps", ((s.frames - prev.frames) / dt).toFixed(1));
+			setStat("sPps", Math.round((s.packets - prev.packets) / dt));
+			setStat("sMbps", (((s.bytes - prev.bytes) * 8 / dt) / 1e6).toFixed(1));
+			setStat("sRelay", s.relayed > 0 ?
+				Math.round((s.relayed - prev.relayed) / dt) + "/s" : "off");
+		}
+	}
+	prev = s; prevT = now;
+	state = s;
+
+	setStat("sMiss", s.missed_columns,
+		s.missed_columns > 0 ? (s.missed_columns > 1000 ? "bad" : "warn") : "");
+
+	near = Infinity;
+	if (s.ring_cm) {
+		for (i = 0; i < s.ring_cm.length; i++)
+			if (s.ring_cm[i] >= 0 && s.ring_cm[i] < near) near = s.ring_cm[i];
+	}
+	setStat("sNear", near === Infinity ? "—" : (near / 100).toFixed(2) + " m",
+		near / 100 < 2 ? "warn" : "");
+
+	el("profilePill").textContent =
+		"lidar: " + s.channels + "ch · " + s.profile;
+
+	var ap = el("alarmPill");
+	if (s.zone_alarm) {
+		ap.textContent = "ZONE INTRUSION";
+		ap.className = "pill alarm";
+	} else {
+		ap.textContent = "zones: clear";
+		ap.className = "pill";
+	}
+
+	el("ringLabel").textContent = s.sectors + " sectors · frame " + s.frame_id;
+	draw();
+}
+
+function poll() {
+	fetch(STATUS_URL, { cache: "no-store" })
+		.then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+		.then(onStatus)
+		.catch(function () {
+			if (Date.now() - lastGood > 3000) {
+				el("linkDot").className = "dot off";
+				el("profilePill").textContent = "lidar: 없음";
+				state = null;
+				draw();
+			}
+		});
+}
+
+resize();
+camConnect();
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

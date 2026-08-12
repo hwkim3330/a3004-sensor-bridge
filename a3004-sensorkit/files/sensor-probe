@@ -1,0 +1,106 @@
+#!/bin/sh
+# sensor-probe - report what the attached sensors can actually do.
+#
+# The whole camera plan hinges on one question that cannot be answered from a
+# datasheet: does the camera emit MJPEG itself? If it does, the router only has
+# to copy frames from USB to the network, which MT7621 handles easily. If it
+# only offers uncompressed YUYV/NV12, something has to compress ~124 MB/s and
+# this SoC cannot, so the usable resolution collapses. Run this on the router
+# with the camera plugged in before trusting any streaming config.
+
+say() { printf '%s\n' "$*"; }
+hdr() { say ""; say "=== $* ==="; }
+
+hdr "board"
+say "model:   $(cat /tmp/sysinfo/model 2>/dev/null || echo unknown)"
+say "board:   $(cat /tmp/sysinfo/board_name 2>/dev/null || echo unknown)"
+say "kernel:  $(uname -r)"
+say "cpu:     $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//')"
+say "memfree: $(awk '/MemAvailable/ {printf "%d MiB", $2/1024}' /proc/meminfo)"
+
+hdr "usb devices"
+if [ -d /sys/bus/usb/devices ]; then
+	for d in /sys/bus/usb/devices/*/; do
+		[ -f "$d/idVendor" ] || continue
+		printf '%s  %s:%s  %s  speed=%sMbps  %s\n' \
+			"$(basename "$d")" \
+			"$(cat "$d/idVendor")" "$(cat "$d/idProduct")" \
+			"$(cat "$d/product" 2>/dev/null || echo '-')" \
+			"$(cat "$d/speed" 2>/dev/null || echo '?')" \
+			"$(cat "$d/manufacturer" 2>/dev/null || echo '')"
+	done
+else
+	say "no usb sysfs - is kmod-usb3 loaded?"
+fi
+
+hdr "uvc"
+if [ ! -e /dev/video0 ]; then
+	say "no /dev/video* - uvcvideo did not bind."
+	say "check: opkg list-installed | grep uvc ; dmesg | grep -i uvc"
+else
+	for v in /dev/video*; do
+		say "--- $v"
+		if command -v v4l2-ctl >/dev/null 2>&1; then
+			v4l2-ctl -d "$v" --info 2>/dev/null | sed 's/^/    /'
+			v4l2-ctl -d "$v" --list-formats-ext 2>/dev/null | sed 's/^/    /'
+		else
+			say "    v4l2-ctl not installed (opkg install v4l-utils)"
+			say "    name: $(cat /sys/class/video4linux/$(basename $v)/name 2>/dev/null)"
+		fi
+	done
+
+	if command -v v4l2-ctl >/dev/null 2>&1; then
+		say ""
+		if v4l2-ctl -d /dev/video0 --list-formats 2>/dev/null | grep -qi 'MJPG\|JPEG'; then
+			say "VERDICT: camera offers MJPEG."
+			say "  -> mjpg-streamer can pass frames through with no transcoding."
+			say "  -> 1280x720@30 is a reasonable starting point over 5 GHz WiFi."
+		else
+			say "VERDICT: NO MJPEG from this camera - uncompressed only."
+			say "  -> MT7621 cannot compress 1080p in software."
+			say "  -> mjpg-streamer must use input_uvc -y (software JPEG); expect"
+			say "     roughly 320x240 at single-digit fps. Reduce expectations or"
+			say "     use a camera with a hardware JPEG encoder."
+		fi
+	fi
+fi
+
+hdr "lidar"
+LIDAR_IP="$(uci -q get ouster-edge.lidar.sensor_ip)"
+if [ -n "$LIDAR_IP" ]; then
+	if ping -c1 -W2 "$LIDAR_IP" >/dev/null 2>&1; then
+		say "sensor $LIDAR_IP reachable"
+		/usr/sbin/ouster-metadata "$LIDAR_IP" 2>&1 | sed 's/^/    /'
+	else
+		say "sensor $LIDAR_IP does not answer ping"
+	fi
+else
+	say "no sensor_ip configured in /etc/config/ouster-edge"
+fi
+
+say ""
+say "dhcp leases:"
+sed 's/^/    /' /tmp/dhcp.leases 2>/dev/null || say "    (none)"
+
+if [ -f /var/run/ouster-edge.json ]; then
+	hdr "ouster-edge status"
+	sed 's/"ring_cm".*/"ring_cm": [ ... ]/' /var/run/ouster-edge.json
+fi
+
+hdr "link speeds"
+for i in $(ls /sys/class/net); do
+	case "$i" in lo|br-*) continue;; esac
+	s="$(cat /sys/class/net/$i/speed 2>/dev/null)"
+	o="$(cat /sys/class/net/$i/operstate 2>/dev/null)"
+	printf '%-10s %-6s %s\n' "$i" "$o" "${s:+${s}Mbps}"
+done
+say ""
+say "A gigabit link is required for an OS-64: 1024x10 is about 64 Mbit/s of"
+say "UDP, and the sensor will not negotiate 100 Mbit at all."
+
+hdr "wifi"
+iwinfo 2>/dev/null | sed 's/^/  /' || say "iwinfo not available"
+say ""
+say "Two radios should appear here (2.4 + 5 GHz). If only one does, the DBDC"
+say "override in the device tree is not taking effect - check:"
+say "  dmesg | grep -i mt7615 ; ls /sys/kernel/debug/ieee80211/"

@@ -1,0 +1,69 @@
+#!/bin/sh
+# sensor-lan-tune - apply the network tuning an Ouster lidar wants.
+#
+# Kept as an explicit command rather than a boot-time default: raising the MTU
+# touches every device on the bridge, and getting it wrong is the kind of thing
+# that looks like a broken lidar. Run it, check the result, then decide whether
+# to make it permanent with the uci commands it prints.
+#
+# Usage: sensor-lan-tune [interface]   (default: br-lan)
+
+IFACE="${1:-br-lan}"
+MTU=9000
+
+die() { echo "$*" >&2; exit 1; }
+
+[ -d "/sys/class/net/$IFACE" ] || die "no such interface: $IFACE"
+
+echo "=== before ==="
+echo "$IFACE MTU: $(cat /sys/class/net/$IFACE/mtu)"
+echo "ipfrag_high_thresh: $(sysctl -n net.ipv4.ipfrag_high_thresh)"
+echo "rmem_max:           $(sysctl -n net.core.rmem_max)"
+echo "netdev_max_backlog:  $(sysctl -n net.core.netdev_max_backlog)"
+
+echo
+echo "=== applying ==="
+
+# An OS-64 sends 12544-byte datagrams. At a 1500-byte MTU each one arrives as
+# nine IP fragments, so 640 packets/s becomes 5760 fragments/s for the CPU to
+# reassemble. A 9000-byte MTU cuts that to two.
+if ip link set dev "$IFACE" mtu "$MTU" 2>/dev/null; then
+	echo "MTU $IFACE -> $MTU"
+else
+	echo "MTU $MTU rejected on $IFACE - the switch or driver will not take it."
+	echo "Reassembly at 1500 still works, it just costs more CPU."
+fi
+
+# Reassembly buffers must hold a burst of fragments, or the tail of a datagram
+# is dropped and the frame shows up with missing columns.
+sysctl -w net.ipv4.ipfrag_high_thresh=8388608 >/dev/null
+sysctl -w net.ipv4.ipfrag_low_thresh=6291456 >/dev/null
+sysctl -w net.ipv4.ipfrag_time=1 >/dev/null
+
+# Socket receive buffer headroom for ouster-edge (it asks for 4 MiB).
+sysctl -w net.core.rmem_max=8388608 >/dev/null
+sysctl -w net.core.rmem_default=1048576 >/dev/null
+sysctl -w net.core.netdev_max_backlog=2000 >/dev/null
+
+echo
+echo "=== after ==="
+echo "$IFACE MTU: $(cat /sys/class/net/$IFACE/mtu)"
+echo "ipfrag_high_thresh: $(sysctl -n net.ipv4.ipfrag_high_thresh)"
+echo "rmem_max:           $(sysctl -n net.core.rmem_max)"
+echo "netdev_max_backlog:  $(sysctl -n net.core.netdev_max_backlog)"
+
+echo
+echo "Watch 'missed_columns' in /var/run/ouster-edge.json for a minute. If it"
+echo "stays flat, make this permanent:"
+echo
+echo "  uci set network.lan.mtu=$MTU"
+echo "  uci commit network"
+echo "  cat >> /etc/sysctl.conf <<'EOF'"
+echo "  net.ipv4.ipfrag_high_thresh=8388608"
+echo "  net.ipv4.ipfrag_low_thresh=6291456"
+echo "  net.core.rmem_max=8388608"
+echo "  net.core.netdev_max_backlog=2000"
+echo "  EOF"
+echo
+echo "Also set the sensor's MTU to match, or it will keep fragmenting:"
+echo "  the lidar's own udp_dest/MTU settings live in its HTTP API."

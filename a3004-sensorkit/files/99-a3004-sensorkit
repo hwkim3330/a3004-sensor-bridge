@@ -1,0 +1,86 @@
+#!/bin/sh
+# Wire the sensor bridge into UCI. Runs once, on first boot.
+
+. /lib/functions.sh
+
+# --- camera ---------------------------------------------------------------
+# 1280x720 MJPEG straight from the camera. On MT7621 the only viable mode is
+# pass-through: the SoC has no JPEG encoder, so 'format MJPEG' must be what
+# the camera itself produces. Run sensor-probe to confirm before raising this.
+uci -q batch <<'EOF'
+set ustreamer.video0=ustreamer
+set ustreamer.video0.enabled='1'
+set ustreamer.video0.device='/dev/video0'
+set ustreamer.video0.resolution='1280x720'
+set ustreamer.video0.format='MJPEG'
+set ustreamer.video0.encoder='CPU'
+set ustreamer.video0.desired_fps='30'
+set ustreamer.video0.quality='80'
+set ustreamer.video0.host='0.0.0.0'
+set ustreamer.video0.port='8080'
+set ustreamer.video0.drop_same_frames='30'
+set ustreamer.video0.buffers='3'
+set ustreamer.video0.workers='2'
+commit ustreamer
+EOF
+
+# --- lidar ----------------------------------------------------------------
+# Enabled but pointed at nothing downstream by default: the ring is published
+# into the status file for the dashboard, and raw relaying stays off until a
+# destination is configured.
+uci -q batch <<'EOF'
+set ouster-edge.lidar.enabled='1'
+commit ouster-edge
+EOF
+
+# Give the lidar a stable address. Ouster sensors default to DHCP and fall back
+# to link-local, so a reservation is what makes the sensor findable again after
+# a power cycle.
+if ! uci -q get dhcp.ouster >/dev/null; then
+	uci -q batch <<'EOF'
+set dhcp.ouster=host
+set dhcp.ouster.name='ouster'
+set dhcp.ouster.ip='192.168.1.50'
+set dhcp.ouster.leasetime='infinite'
+commit dhcp
+EOF
+	logger -t sensorkit "reserved 192.168.1.50 for the lidar; set dhcp.ouster.mac to its MAC"
+fi
+
+# --- firewall -------------------------------------------------------------
+# The camera stream and the dashboard are LAN-only. Nothing is opened on WAN.
+if ! uci -q get firewall.sensorkit_stream >/dev/null; then
+	uci -q batch <<'EOF'
+set firewall.sensorkit_stream=rule
+set firewall.sensorkit_stream.name='Allow-MJPEG-LAN'
+set firewall.sensorkit_stream.src='lan'
+set firewall.sensorkit_stream.proto='tcp'
+set firewall.sensorkit_stream.dest_port='8080'
+set firewall.sensorkit_stream.target='ACCEPT'
+commit firewall
+EOF
+fi
+
+# --- wifi -----------------------------------------------------------------
+# Both radios exist only when the DBDC override in the device tree is working.
+# Bring up the 5 GHz one as the data-carrying AP for a tablet, and leave 2.4
+# for control/fallback. Radios stay disabled=0 but the password must be set by
+# hand - shipping a default one would be worse than making it a visible step.
+for r in 0 1; do
+	uci -q get wireless.radio$r >/dev/null || continue
+	uci -q set wireless.radio$r.disabled='0'
+	uci -q set wireless.radio$r.country='KR'
+done
+
+band0="$(uci -q get wireless.radio0.band)"
+band1="$(uci -q get wireless.radio1.band)"
+logger -t sensorkit "radio0 band=${band0:-unknown} radio1 band=${band1:-unknown}"
+
+if [ -z "$band1" ]; then
+	logger -t sensorkit "WARNING: only one radio present - DBDC override is not active, see doc/DBDC.md"
+fi
+
+uci -q commit wireless
+
+logger -t sensorkit "sensor bridge configured; dashboard at http://192.168.1.1/sensors/"
+exit 0

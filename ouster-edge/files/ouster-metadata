@@ -1,0 +1,46 @@
+#!/bin/sh
+# Query an Ouster sensor's HTTP API and print its data format as shell
+# assignments, so the init script does not have to hardcode a layout that may
+# not match how the sensor is actually configured.
+#
+#   eval "$(ouster-metadata 192.168.1.50)"
+#   -> OUSTER_CHANNELS=64 OUSTER_COLUMNS=16 OUSTER_SCAN_WIDTH=1024 ...
+#
+# Exits non-zero and prints nothing on failure; callers should fall back to
+# their configured defaults.
+
+HOST="$1"
+[ -n "$HOST" ] || { echo "usage: ouster-metadata <sensor-ip>" >&2; exit 2; }
+
+TMP="/tmp/ouster-metadata.$$"
+trap 'rm -f "$TMP"' EXIT
+
+fetch() {
+	uclient-fetch -q -T 5 -O "$TMP" "http://$HOST$1" 2>/dev/null
+}
+
+# Firmware 2.x exposes the whole metadata blob; 1.x only the data format.
+if fetch /api/v1/sensor/metadata; then
+	BASE='$.data_format'
+elif fetch /api/v1/sensor/metadata/lidar_data_format; then
+	BASE='$'
+else
+	echo "cannot reach sensor at $HOST" >&2
+	exit 1
+fi
+
+get() {
+	jsonfilter -i "$TMP" -e "$BASE.$1" 2>/dev/null
+}
+
+CH="$(get pixels_per_column)"
+COL="$(get columns_per_packet)"
+WIDTH="$(get columns_per_frame)"
+PROFILE="$(get udp_profile_lidar)"
+
+[ -n "$CH" ] || { echo "unexpected metadata from $HOST" >&2; exit 1; }
+
+echo "OUSTER_CHANNELS=${CH}"
+echo "OUSTER_COLUMNS=${COL:-16}"
+echo "OUSTER_SCAN_WIDTH=${WIDTH:-1024}"
+echo "OUSTER_PROFILE=${PROFILE:-LEGACY}"

@@ -1,0 +1,90 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/sbin/ouster-edge
+STATUS=/var/run/ouster-edge.json
+
+append_zone() {
+	local cfg="$1"
+	local az_start az_end range
+
+	config_get az_start "$cfg" az_start
+	config_get az_end "$cfg" az_end
+	config_get range "$cfg" range
+
+	[ -n "$az_start" ] && [ -n "$az_end" ] && [ -n "$range" ] || return 0
+	procd_append_param command --zone "${az_start}:${az_end}:${range}"
+}
+
+start_service() {
+	local enabled port sensor_ip channels columns scan_width sectors
+	local channel_band min_range max_range relay ring status_interval action
+
+	config_load ouster-edge
+	config_get_bool enabled lidar enabled 0
+	[ "$enabled" = "1" ] || return 0
+
+	config_get port          lidar port 7502
+	config_get sensor_ip     lidar sensor_ip
+	config_get channels      lidar channels 64
+	config_get columns       lidar columns 16
+	config_get scan_width    lidar scan_width 1024
+	config_get sectors       lidar sectors 360
+	config_get channel_band  lidar channel_band
+	config_get min_range     lidar min_range 0.3
+	config_get max_range     lidar max_range 100
+	config_get relay         lidar relay
+	config_get ring          lidar ring
+	config_get status_interval lidar status_interval 200
+	config_get action        lidar action
+
+	# Prefer what the sensor reports over what is configured here - the
+	# lidar mode can be changed on the sensor without anyone updating UCI.
+	if [ -n "$sensor_ip" ]; then
+		if eval "$(/usr/sbin/ouster-metadata "$sensor_ip" 2>/dev/null)"; then
+			channels="${OUSTER_CHANNELS:-$channels}"
+			columns="${OUSTER_COLUMNS:-$columns}"
+			scan_width="${OUSTER_SCAN_WIDTH:-$scan_width}"
+			logger -t ouster-edge \
+			  "sensor $sensor_ip reports ${channels}ch x ${columns}col, width ${scan_width}, profile ${OUSTER_PROFILE}"
+		else
+			logger -t ouster-edge \
+			  "sensor $sensor_ip unreachable, using configured layout ${channels}ch x ${columns}col"
+		fi
+	fi
+
+	procd_open_instance
+	procd_set_param command "$PROG" \
+		--port "$port" \
+		--channels "$channels" \
+		--columns "$columns" \
+		--scan-width "$scan_width" \
+		--sectors "$sectors" \
+		--min-range "$min_range" \
+		--max-range "$max_range" \
+		--status "$STATUS" \
+		--status-interval "$status_interval"
+
+	[ -n "$channel_band" ] && procd_append_param command --channel-band "$channel_band"
+	[ -n "$relay" ] && procd_append_param command --relay "$relay"
+	[ -n "$ring" ]  && procd_append_param command --ring "$ring"
+	[ -n "$action" ] && procd_append_param command --action "$action"
+
+	config_foreach append_zone zone
+
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	rm -f "$STATUS"
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ouster-edge"
+}
