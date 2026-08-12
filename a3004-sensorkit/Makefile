@@ -57,6 +57,7 @@ define Package/a3004-sensorkit/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/sensor-probe $(1)/usr/sbin/sensor-probe
 	$(INSTALL_BIN) ./files/sensor-lan-tune $(1)/usr/sbin/sensor-lan-tune
+	$(INSTALL_BIN) ./files/first-boot-report $(1)/usr/sbin/first-boot-report
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/99-a3004-sensorkit $(1)/etc/uci-defaults/99-a3004-sensorkit

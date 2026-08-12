@@ -1,0 +1,139 @@
+#!/bin/sh
+# first-boot-report - collect everything about this board that can only be known
+# with the board in hand, in one pass.
+#
+# Several open questions in doc/ are open only because nobody has read this
+# device's silicon: whether DBDC actually comes up, what the EEPROM says about
+# the antenna configuration, and which interface's MAC is on the sticker. Each
+# has a decision hanging off it, so gather them all at once rather than
+# discovering later that one is missing.
+#
+#   first-boot-report > /tmp/report.txt
+#
+# Then copy that file off the router. It is plain text and contains MAC
+# addresses; treat it as you would any device inventory.
+
+say() { printf '%s\n' "$*"; }
+hdr() { say ""; say "===== $* ====="; }
+
+say "A3004NS-M first boot report"
+say "generated: $(date 2>/dev/null || echo 'no clock yet')"
+
+hdr "identity"
+say "model:    $(cat /tmp/sysinfo/model 2>/dev/null)"
+say "board:    $(cat /tmp/sysinfo/board_name 2>/dev/null)"
+say "release:  $(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_RELEASE $DISTRIB_REVISION")"
+say "kernel:   $(uname -r)"
+say "uptime:   $(cut -d' ' -f1 /proc/uptime)s"
+
+hdr "QUESTION 1: did DBDC come up?"
+say "This is the whole reason the port was never merged. Two phys = fixed."
+say ""
+say "phys present:"
+ls /sys/class/ieee80211/ 2>/dev/null | sed 's/^/    /'
+say ""
+N=$(ls /sys/class/ieee80211/ 2>/dev/null | grep -c phy)
+if [ "${N:-0}" -ge 2 ]; then
+	say "VERDICT: $N phys -> DBDC is working."
+else
+	say "VERDICT: $N phy -> DBDC did NOT come up. See doc/DBDC.md."
+	say "  is the property in the running device tree?"
+	for f in /sys/firmware/devicetree/base/pcie*/pcie*/wifi*/mediatek,dbdc \
+	         /proc/device-tree/pcie*/pcie*/wifi*/mediatek,dbdc; do
+		[ -e "$f" ] && say "    present: $f"
+	done
+	say "  is the driver aware of it?"
+	if [ -d /sys/kernel/debug/ieee80211/phy0/mt76 ]; then
+		say "    debugfs dbdc knob: $(cat /sys/kernel/debug/ieee80211/phy0/mt76/dbdc 2>/dev/null)"
+		say "    (echo 1 > that path is the old workaround, to confirm the"
+		say "     hardware really is DBDC even if the property did not take)"
+	fi
+fi
+
+say ""
+say "per-phy detail:"
+for p in /sys/class/ieee80211/*; do
+	[ -d "$p" ] || continue
+	n=$(basename "$p")
+	say "  $n:"
+	say "    macaddress: $(cat "$p/macaddress" 2>/dev/null)"
+	if command -v iw >/dev/null 2>&1; then
+		iw phy "$n" info 2>/dev/null | awk '
+			/Frequencies:/ {f=1}
+			f && /MHz/ && !/disabled/ {print "    band: " $2 " MHz"; f=0}
+			/Configured Antennas|Available Antennas/ {print "    " $0}
+		' | head -4
+	fi
+done
+
+say ""
+say "uci wireless as generated:"
+uci show wireless 2>/dev/null | grep -E "radio[0-9]+\.(band|path|channel|htmode)" | sed 's/^/    /'
+
+hdr "QUESTION 2: what does the EEPROM say?"
+say "0x3e bits 5:4 are the band config the driver reads."
+say "  00 dual band (what this board reports, and the bug)"
+say "  11 DBDC"
+V=$(hexdump -e '1/1 "%02x"' -s 62 -n 1 /dev/mtd2 2>/dev/null)
+say "  byte at 0x3e: 0x${V:-??}"
+say ""
+say "MT_EE_NIC_CONF_0 (0x34) sets the chainmask, which decides whether the"
+say "DBDC split is 2x2+2x2 or 1x1+1x1. Expected 2x2+2x2, never read:"
+say "  byte at 0x34: 0x$(hexdump -e '1/1 "%02x"' -s 52 -n 1 /dev/mtd2 2>/dev/null)"
+say ""
+say "first 64 bytes of the factory partition:"
+hexdump -C -n 64 /dev/mtd2 2>/dev/null | sed 's/^/    /'
+
+hdr "QUESTION 3: which MAC is on the sticker?"
+say "doc/UPSTREAM.md drops label-mac-device because this is unknown."
+say "Compare these against the label printed on the case:"
+say ""
+for i in $(ls /sys/class/net 2>/dev/null); do
+	case "$i" in lo) continue;; esac
+	say "  $(printf '%-10s' "$i") $(cat /sys/class/net/$i/address 2>/dev/null)"
+done
+say ""
+say "u-boot 0x1fc20: $(hexdump -e '6/1 "%02x:" "\n"' -s 130080 -n 6 /dev/mtd0 2>/dev/null | sed 's/:$//')"
+say "u-boot 0x1fc40: $(hexdump -e '6/1 "%02x:" "\n"' -s 130112 -n 6 /dev/mtd0 2>/dev/null | sed 's/:$//')"
+say "factory 0x4:    $(hexdump -e '6/1 "%02x:" "\n"' -s 4 -n 6 /dev/mtd2 2>/dev/null | sed 's/:$//')"
+
+hdr "flash layout"
+cat /proc/mtd 2>/dev/null | sed 's/^/    /'
+say ""
+say "free space:"
+df -h / /overlay 2>/dev/null | sed 's/^/    /'
+
+hdr "ethernet"
+for i in $(ls /sys/class/net 2>/dev/null); do
+	case "$i" in lo|br-*|wlan*) continue;; esac
+	printf '    %-10s %-8s %s\n' "$i" \
+		"$(cat /sys/class/net/$i/operstate 2>/dev/null)" \
+		"$(cat /sys/class/net/$i/speed 2>/dev/null | sed 's/$/Mbps/')"
+done
+say ""
+say "A gigabit link is required for an OS-64; it will not negotiate 100."
+
+hdr "usb"
+for d in /sys/bus/usb/devices/*/; do
+	[ -f "$d/idVendor" ] || continue
+	printf '    %s:%s speed=%s %s\n' \
+		"$(cat "$d/idVendor")" "$(cat "$d/idProduct")" \
+		"$(cat "$d/speed" 2>/dev/null)" \
+		"$(cat "$d/product" 2>/dev/null)"
+done
+say ""
+say "video devices: $(ls /dev/video* 2>/dev/null | tr '\n' ' ')"
+say "sound cards:"
+cat /proc/asound/cards 2>/dev/null | sed 's/^/    /'
+
+hdr "wifi driver messages"
+logread 2>/dev/null | grep -iE "mt76|mt7615|ieee80211" | tail -20 | sed 's/^/    /'
+dmesg 2>/dev/null | grep -iE "mt76|mt7615" | tail -10 | sed 's/^/    /'
+
+hdr "anything that failed to start"
+logread 2>/dev/null | grep -iE "error|fail|warn" | tail -15 | sed 's/^/    /'
+
+say ""
+say "===== end ====="
+say "Open questions this report answers: DBDC (1), antenna split (2),"
+say "label MAC (3). doc/UPSTREAM.md cannot be completed without them."

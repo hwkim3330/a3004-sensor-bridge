@@ -14,7 +14,8 @@ is fixed here — see `doc/DBDC.md`.
 | | |
 |---|---|
 | [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) | what runs on the router and what does not, with the bandwidth, CPU and latency numbers behind each decision |
-| [`doc/BRINGUP.md`](doc/BRINGUP.md) | build, flash, and bring each sensor up in order |
+| [`doc/TOMORROW.md`](doc/TOMORROW.md) | **the bench runbook** — one page, in order, with the decision at each step |
+| [`doc/BRINGUP.md`](doc/BRINGUP.md) | the same ground with the reasoning attached |
 | [`doc/DBDC.md`](doc/DBDC.md) | why the upstream port was never merged, and the fix |
 | [`doc/CAN.md`](doc/CAN.md) | USB-CAN wiring, bus termination, and why injection is off by default |
 | [`doc/RC-AND-WIFI.md`](doc/RC-AND-WIFI.md) | why no WiFi chip can receive FlySky AFHDS 2A, what to do instead, and how many radios and SSIDs the DBDC fix buys |
