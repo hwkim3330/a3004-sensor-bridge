@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -31,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <syslog.h>
@@ -41,6 +43,7 @@
 #define MAX_PKT		40000
 #define MAX_SECTORS	4096
 #define MAX_ZONES	16
+#define MAX_SSE		8
 #define RING_MAGIC	0x4445534fu	/* "OSED" little-endian */
 #define RING_VERSION	1
 
@@ -101,6 +104,12 @@ static struct {
 	bool foreground;
 
 	int status_ms;
+	int sse_port;
+
+	/* zone_mask[sector] has bit z set when sector falls inside zone z, so a
+	 * column can be tested against every zone with one array lookup instead
+	 * of sweeping the whole ring once per revolution. */
+	uint16_t zone_mask[MAX_SECTORS];
 
 	/* runtime */
 	struct layout layout;
@@ -118,6 +127,9 @@ static struct {
 	uint64_t last_pkt_ms;
 	struct stats st;
 	bool zone_alarm;
+	uint16_t zone_hit;		/* zones touched during this revolution */
+	int sse[MAX_SSE];
+	int nsse;
 } g;
 
 static volatile sig_atomic_t stop_requested;
@@ -258,6 +270,24 @@ static uint64_t now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+static void zones_index(void)
+{
+	int i, z;
+
+	memset(g.zone_mask, 0, sizeof(g.zone_mask));
+	for (i = 0; i < g.sectors; i++) {
+		int az = (int)(((long)i * 360000L) / g.sectors);
+
+		for (z = 0; z < g.nzones; z++) {
+			int azw = az < g.zones[z].az_start_mdeg ? az + 360000 : az;
+
+			if (azw >= g.zones[z].az_start_mdeg &&
+			    azw <= g.zones[z].az_end_mdeg)
+				g.zone_mask[i] |= (uint16_t)(1u << z);
+		}
+	}
+}
+
 static void ring_reset(void)
 {
 	int i;
@@ -285,42 +315,59 @@ static void run_action(const char *event)
 		       strerror(errno));
 }
 
-static void zones_evaluate(void)
+/*
+ * Called for every column as it arrives, not once per revolution. A zone
+ * crossing is what the local reflex reacts to, so waiting for the rotation to
+ * finish would add up to a full 100 ms at 10 Hz for no reason.
+ */
+static void zones_column(int sector, uint32_t range_mm)
 {
-	bool alarm = false;
+	uint16_t mask = g.zone_mask[sector];
+	int z;
+
+	if (!mask)
+		return;
+
+	for (z = 0; z < g.nzones; z++) {
+		if (!(mask & (1u << z)))
+			continue;
+		if (range_mm > g.zones[z].max_range_mm)
+			continue;
+
+		g.zone_hit |= (uint16_t)(1u << z);
+
+		if (!g.zones[z].active) {
+			g.zones[z].active = true;
+			logmsg(LOG_NOTICE, "zone %d ENTERED", z);
+		}
+		/* Rising edge fires as soon as one intruding column lands. */
+		if (!g.zone_alarm) {
+			g.zone_alarm = true;
+			run_action("alarm");
+		}
+	}
+}
+
+/*
+ * Clearing is the asymmetric half: it takes a full clean revolution to know
+ * nothing is there, so it can only be decided at the frame boundary.
+ */
+static void zones_revolution_end(void)
+{
 	int z;
 
 	for (z = 0; z < g.nzones; z++) {
-		struct zone *zn = &g.zones[z];
-		bool hit = false;
-		int i;
-
-		for (i = 0; i < g.sectors && !hit; i++) {
-			/* sector centre azimuth in millidegrees */
-			int az = (int)(((long)i * 360000L) / g.sectors);
-			int azw = az < zn->az_start_mdeg ? az + 360000 : az;
-			uint32_t r;
-
-			if (azw < zn->az_start_mdeg || azw > zn->az_end_mdeg)
-				continue;
-
-			r = g.ring_pub[i];
-			if (r == 0xffff)
-				continue;
-			if (r * 10u <= zn->max_range_mm)
-				hit = true;
+		if (g.zones[z].active && !(g.zone_hit & (1u << z))) {
+			g.zones[z].active = false;
+			logmsg(LOG_NOTICE, "zone %d clear", z);
 		}
-
-		if (hit != zn->active)
-			logmsg(LOG_NOTICE, "zone %d %s", z, hit ? "ENTERED" : "clear");
-		zn->active = hit;
-		alarm = alarm || hit;
 	}
 
-	if (alarm != g.zone_alarm) {
-		g.zone_alarm = alarm;
-		run_action(alarm ? "alarm" : "clear");
+	if (g.zone_alarm && !g.zone_hit) {
+		g.zone_alarm = false;
+		run_action("clear");
 	}
+	g.zone_hit = 0;
 }
 
 static void ring_publish(int sock)
@@ -359,6 +406,118 @@ static void ring_publish(int sock)
 	if (sendto(sock, buf, off, 0, (struct sockaddr *)&g.ring_to,
 		   sizeof(g.ring_to)) < 0 && errno != EAGAIN)
 		logmsg(LOG_WARNING, "ring sendto: %s", strerror(errno));
+}
+
+/*
+ * A tiny Server-Sent Events endpoint. Polling a status file costs up to a full
+ * poll interval of latency on top of the write interval; pushing costs none.
+ * SSE rather than WebSocket because it needs no handshake, no SHA-1, and no
+ * frame masking - just a header and "data: ...\n\n" per event.
+ */
+static int sse_listen(int port)
+{
+	struct sockaddr_in a;
+	int fd, on = 1;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_ANY);
+	a.sin_port = htons((uint16_t)port);
+	if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 ||
+	    listen(fd, 4) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static void sse_drop(int idx)
+{
+	close(g.sse[idx]);
+	g.sse[idx] = g.sse[--g.nsse];
+}
+
+static void sse_accept(int lfd)
+{
+	static const char hdr[] =
+		"HTTP/1.0 200 OK\r\n"
+		"Content-Type: text/event-stream\r\n"
+		"Cache-Control: no-store\r\n"
+		"Connection: close\r\n"
+		"Access-Control-Allow-Origin: *\r\n"
+		"\r\n";
+	int fd = accept(lfd, NULL, NULL);
+	int on = 1;
+
+	if (fd < 0)
+		return;
+	if (g.nsse >= MAX_SSE) {
+		close(fd);
+		return;
+	}
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+	/* Without TCP_NODELAY a 1 kB event can sit in Nagle's queue, which is
+	 * exactly the delay this endpoint exists to avoid. */
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+	if (write(fd, hdr, sizeof(hdr) - 1) < 0) {
+		close(fd);
+		return;
+	}
+	g.sse[g.nsse++] = fd;
+}
+
+static void sse_broadcast(const char *buf, size_t len)
+{
+	int i;
+
+	for (i = 0; i < g.nsse; ) {
+		ssize_t n = write(g.sse[i], buf, len);
+
+		/* A reader that cannot keep up gets dropped rather than allowed
+		 * to back-pressure the lidar path. */
+		if (n < 0 && errno != EINTR &&
+		    errno != EAGAIN && errno != EWOULDBLOCK) {
+			sse_drop(i);
+			continue;
+		}
+		i++;
+	}
+}
+
+static size_t ring_json(char *buf, size_t cap)
+{
+	size_t off = 0;
+	int i;
+
+	off += (size_t)snprintf(buf + off, cap - off,
+		"data: {\"frame_id\":%d,\"sectors\":%d,\"zone_alarm\":%s,"
+		"\"packets\":%llu,\"bytes\":%llu,\"frames\":%llu,"
+		"\"relayed\":%llu,\"missed_columns\":%llu,\"age_ms\":0,"
+		"\"channels\":%d,\"profile\":\"%s\",\"ring_cm\":[",
+		g.cur_frame, g.sectors, g.zone_alarm ? "true" : "false",
+		(unsigned long long)g.st.packets, (unsigned long long)g.st.bytes,
+		(unsigned long long)g.st.frames,
+		(unsigned long long)g.st.relayed,
+		(unsigned long long)g.st.gap_cols,
+		g.layout.channels, profile_name(g.layout.profile));
+
+	for (i = 0; i < g.sectors && off + 8 < cap; i++) {
+		if (g.ring_pub[i] == 0xffff)
+			off += (size_t)snprintf(buf + off, cap - off,
+						i ? ",-1" : "-1");
+		else
+			off += (size_t)snprintf(buf + off, cap - off,
+						i ? ",%u" : "%u",
+						g.ring_pub[i]);
+	}
+	off += (size_t)snprintf(buf + off, cap - off, "]}\n\n");
+	return off;
 }
 
 static void status_write(void)
@@ -425,8 +584,16 @@ static void frame_complete(int txsock)
 	g.st.frames++;
 	memcpy(g.ring_pub, g.ring_min, sizeof(g.ring_pub[0]) * g.sectors);
 	memcpy(g.ring_refl_pub, g.ring_refl, sizeof(g.ring_refl_pub[0]) * g.sectors);
-	zones_evaluate();
+	zones_revolution_end();
 	ring_publish(txsock);
+
+	if (g.nsse) {
+		static char json[64 + MAX_SECTORS * 8];
+		size_t n = ring_json(json, sizeof(json));
+
+		sse_broadcast(json, n);
+	}
+
 	ring_reset();
 }
 
@@ -505,6 +672,8 @@ static void packet_process(const uint8_t *pkt, size_t len, int txsock)
 		if (sector < 0 || sector >= g.sectors)
 			continue;
 
+		zones_column(sector, best);
+
 		/* Store centimetres so 16 bits covers the full 655 m range. */
 		if (best / 10u < g.ring_min[sector]) {
 			g.ring_min[sector] = (uint16_t)(best / 10u);
@@ -571,6 +740,7 @@ static void usage(const char *argv0)
 "  -a, --action CMD         run 'CMD alarm' / 'CMD clear' on zone changes\n"
 "  -S, --status PATH        JSON status file (default /var/run/ouster-edge.json)\n"
 "  -I, --status-interval MS  how often to rewrite the status file (default 200)\n"
+"  -E, --sse-port PORT      push each revolution as Server-Sent Events (0 = off)\n"
 "  -f, --foreground         log to stderr instead of syslog\n"
 "  -h, --help               this text\n", argv0);
 }
@@ -592,6 +762,7 @@ int main(int argc, char **argv)
 		{ "action",       required_argument, NULL, 'a' },
 		{ "status",       required_argument, NULL, 'S' },
 		{ "status-interval", required_argument, NULL, 'I' },
+		{ "sse-port",     required_argument, NULL, 'E' },
 		{ "foreground",   no_argument,       NULL, 'f' },
 		{ "help",         no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -602,8 +773,8 @@ int main(int argc, char **argv)
 	struct sockaddr_in from[BATCH];
 	struct sockaddr_in addr;
 	struct sigaction sa;
-	struct timeval rcvtimeo;
-	int sock, txsock, rcvbuf = 4 * 1024 * 1024, opt, i;
+	struct pollfd pfd[2 + MAX_SSE];
+	int sock, txsock, lfd = -1, rcvbuf = 4 * 1024 * 1024, opt, i;
 	uint64_t last_status = 0;
 
 	g.listen_port = 7502;
@@ -617,10 +788,11 @@ int main(int argc, char **argv)
 	g.max_range_mm = 200000;
 	g.status_path = (char *)"/var/run/ouster-edge.json";
 	g.status_ms = 200;
+	g.sse_port = 7603;
 	g.cur_frame = -1;
 	g.last_mid = -1;
 
-	while ((opt = getopt_long(argc, argv, "p:c:C:w:s:b:m:M:r:o:z:a:S:I:fh",
+	while ((opt = getopt_long(argc, argv, "p:c:C:w:s:b:m:M:r:o:z:a:S:I:E:fh",
 				  opts, NULL)) != -1) {
 		switch (opt) {
 		case 'p': g.listen_port = atoi(optarg); break;
@@ -659,6 +831,7 @@ int main(int argc, char **argv)
 		case 'a': g.action = optarg; break;
 		case 'S': g.status_path = optarg; break;
 		case 'I': g.status_ms = atoi(optarg); break;
+		case 'E': g.sse_port = atoi(optarg); break;
 		case 'f': g.foreground = true; break;
 		case 'h': usage(argv[0]); return 0;
 		default: usage(argv[0]); return 1;
@@ -706,12 +879,6 @@ int main(int argc, char **argv)
 	if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0)
 		logmsg(LOG_WARNING, "SO_RCVBUF: %s", strerror(errno));
 
-	rcvtimeo.tv_sec = 0;
-	rcvtimeo.tv_usec = 200000;
-	if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcvtimeo,
-		       sizeof(rcvtimeo)) < 0)
-		logmsg(LOG_WARNING, "SO_RCVTIMEO: %s", strerror(errno));
-
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -734,12 +901,55 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* Non-blocking: poll() below owns the waiting, so a quiet sensor still
+	 * lets the status file refresh and SSE clients connect. */
+	fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0) | O_NONBLOCK);
+
+	if (g.sse_port > 0) {
+		lfd = sse_listen(g.sse_port);
+		if (lfd < 0)
+			logmsg(LOG_WARNING, "cannot listen on :%d for SSE: %s",
+			       g.sse_port, strerror(errno));
+		else
+			logmsg(LOG_NOTICE, "SSE on :%d", g.sse_port);
+	}
+
+	zones_index();
 	ring_reset();
-	logmsg(LOG_NOTICE, "listening on :%d, %d ch x %d col, %d sectors",
-	       g.listen_port, g.channels, g.columns, g.sectors);
+	logmsg(LOG_NOTICE, "listening on :%d, %d ch x %d col, %d sectors, %d zones",
+	       g.listen_port, g.channels, g.columns, g.sectors, g.nzones);
 
 	while (!stop_requested) {
-		int n;
+		int n, np = 0;
+
+		pfd[np].fd = sock;
+		pfd[np].events = POLLIN;
+		pfd[np++].revents = 0;
+		if (lfd >= 0) {
+			pfd[np].fd = lfd;
+			pfd[np].events = POLLIN;
+			pfd[np++].revents = 0;
+		}
+		for (i = 0; i < g.nsse; i++) {
+			pfd[np].fd = g.sse[i];
+			pfd[np].events = 0;	/* only interested in hangups */
+			pfd[np++].revents = 0;
+		}
+
+		if (poll(pfd, (nfds_t)np, g.status_ms) < 0 && errno != EINTR)
+			logmsg(LOG_WARNING, "poll: %s", strerror(errno));
+
+		if (lfd >= 0 && (pfd[1].revents & POLLIN))
+			sse_accept(lfd);
+
+		/* Reap readers that went away, so a closed tab does not leave a
+		 * socket occupying a slot forever. */
+		for (i = g.nsse - 1; i >= 0; i--) {
+			int slot = (lfd >= 0 ? 2 : 1) + i;
+
+			if (slot < np && (pfd[slot].revents & (POLLERR | POLLHUP | POLLNVAL)))
+				sse_drop(i);
+		}
 
 		memset(msgs, 0, sizeof(msgs));
 		for (i = 0; i < BATCH; i++) {
@@ -751,14 +961,12 @@ int main(int argc, char **argv)
 			msgs[i].msg_hdr.msg_namelen = sizeof(from[i]);
 		}
 
-		n = recvmmsg(sock, msgs, BATCH, MSG_WAITFORONE, NULL);
+		n = recvmmsg(sock, msgs, BATCH, 0, NULL);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				/* receive timeout: no lidar traffic. Fall through
-				 * so the status file is still refreshed. */
-				n = 0;
+				n = 0;		/* no lidar traffic this tick */
 			} else {
 				logmsg(LOG_ERR, "recvmmsg: %s", strerror(errno));
 				break;
@@ -811,6 +1019,10 @@ int main(int argc, char **argv)
 	       (unsigned long long)g.st.packets,
 	       (unsigned long long)g.st.frames);
 	status_write();
+	while (g.nsse)
+		sse_drop(0);
+	if (lfd >= 0)
+		close(lfd);
 	free(bufs);
 	close(sock);
 	close(txsock);

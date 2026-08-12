@@ -33,9 +33,23 @@ Doubling either the rotation rate or the horizontal resolution doubles that to
 **128 Mbit/s**. Both figures fit a gigabit port with room to spare, and both
 fit a clean 5 GHz 2×2 VHT80 link (realistically 300–400 Mbit/s of TCP).
 
-The camera, if it emits MJPEG itself, is roughly 30–60 Mbit/s at 720p30 and
-quality 80 — very content-dependent. Camera plus lidar together stay inside a
-single 5 GHz link, which is what makes the tablet-on-the-router-AP setup work.
+The camera question is settled: a Logitech StreamCam (VU0054, `046d:0893`) was
+plugged in and probed. It **does** offer MJPEG, up to 1920×1080, and enumerated
+at USB 3.0 SuperSpeed. Measured bitrates, `-c copy` off the real device:
+
+| mode | MB/s | Mbit/s |
+|---|---|---|
+| 1280×720 @ 30 | 2.26 | **19.0** |
+| 1280×720 @ 60 | 4.73 | **39.6** |
+| 1920×1080 @ 30 | 4.70 | **39.4** |
+| 1920×1080 @ 60 | 9.89 | **82.9** |
+
+MJPEG is intra-frame, so these scale with scene detail; a busy scene will run
+higher. The microphone adds 0.26 Mbit/s (16 kHz mono S16, uncompressed).
+
+Camera plus lidar together stay inside a single 5 GHz link — 1080p60 plus an
+OS-64 is about 147 Mbit/s against 300–400 Mbit/s of realistic 2×2 VHT80 TCP.
+That is what makes the tablet-on-the-router-AP setup work.
 
 100 Mbit is not an option: the sensor will not negotiate it, and 64 Mbit/s of
 UDP on a 100 Mbit link has no headroom for retransmit-free delivery.
@@ -48,6 +62,8 @@ UDP on a 100 Mbit link has no headroom for retransmit-free delivery.
 | `ouster-edge` range-ring reduction | ~655k integer min-compares/s ≈ **under 1% of one core** |
 | Raw relay (one extra `sendto` per packet) | small; 8 MB/s of copying |
 | MJPEG pass-through (`ustreamer`) | small; USB DMA in, socket out, no encode |
+| Microphone pass-through (`mic-stream`) | negligible; 32 kB/s copied, no codec |
+| CAN bridge | negligible; a busy 500 kbps bus is under 4000 frames/s |
 | **IP fragment reassembly at 1500 MTU** | **the real cost** — see below |
 
 12544-byte datagrams do not fit a 1500-byte MTU, so each one arrives as nine
@@ -82,17 +98,37 @@ parse better. So the router forwards raw and computes only things that are
    either a LAN port or its own 5 GHz AP.
 2. **Serves the camera** as MJPEG over HTTP, pass-through, no transcode.
 3. **Reduces.** Each lidar revolution becomes a 360-sector minimum-range ring:
-   1440 bytes per revolution instead of 6.4 MB. That is a 4400× reduction, and
-   it is enough for obstacle presence, nearest-range, and zone logic.
-4. **Reacts.** Polar zones are evaluated every revolution at 10 Hz, and a
-   crossing runs a script. A local reflex with a 100 ms budget is exactly the
-   kind of work that belongs on the node next to the sensor rather than on a
-   machine at the other end of a WiFi link.
+   1100 bytes, against 64 packets × 12544 B = 803 kB of raw revolution. A 730×
+   reduction, and enough for obstacle presence, nearest-range and zone logic.
+4. **Reacts.** Polar zones are evaluated on **every column as it arrives**, not
+   once per revolution, so an intrusion fires within a packet — measured at
+   1.4 ms rather than the up-to-100 ms a per-revolution check would cost at
+   10 Hz. Clearing is the asymmetric half and does wait for a full clean
+   revolution, because that is what it takes to know nothing is there. A local
+   reflex on this budget is exactly the work that belongs on the node next to
+   the sensor rather than a machine across a WiFi link.
 5. **Relays.** The raw stream is forwarded verbatim to a real machine when one
    is present, so nothing is lost by putting the router in the path.
-6. **Hosts a dashboard** on port 80 that renders both the camera and the ring,
-   so a tablet on the router's own WiFi is a complete client with no other
-   machine involved.
+6. **Hosts a dashboard** on port 80 that renders the camera, the ring, the
+   microphone and CAN telemetry, so a tablet on the router's own WiFi is a
+   complete client with no other machine involved.
+
+## Latency
+
+Measured on a desktop (`../ouster-edge/test/test_latency.py`); an 880 MHz MIPS
+part will be slower, but the structure is what matters:
+
+| path | latency | why |
+|---|---|---|
+| zone intrusion → action script | **1.4–1.7 ms** | zones are evaluated per *column*, not per revolution. A per-revolution design cannot beat ~100 ms at 10 Hz |
+| completed revolution → dashboard | **0.2–0.7 ms** | pushed as Server-Sent Events. Polling the status file costs up to one write interval plus one poll interval, so 200–450 ms |
+| camera frame interval | 16.7 ms | 60 fps rather than 30, with `drop_same_frames` off and `tcp_nodelay` on |
+| microphone | one ALSA period, 10 ms | no codec, so no encoder delay; the browser adds ~80 ms of jitter buffer |
+
+The lidar itself sets the floor for anything ring-shaped: a revolution at 10 Hz
+is 100 ms. Running the sensor at 20 Hz halves that and doubles the bandwidth to
+128 Mbit/s. The zone path deliberately does not wait for a revolution, which is
+why it is two orders of magnitude faster than the ring.
 
 ## Topologies
 

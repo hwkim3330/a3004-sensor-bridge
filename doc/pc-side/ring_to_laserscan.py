@@ -99,9 +99,9 @@ class RingToLaserScan(Node):
                 return
             except BlockingIOError:
                 return
-            self.handle(data)
+            self.on_ring(data)
 
-    def handle(self, data: bytes):
+    def on_ring(self, data: bytes):
         if len(data) < HEADER or data[:4] != MAGIC:
             return
 

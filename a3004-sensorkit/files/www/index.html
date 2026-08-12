@@ -34,11 +34,12 @@ body {
 header {
 	display: flex;
 	align-items: center;
-	gap: 12px;
+	gap: 10px;
 	padding: 10px 16px;
 	border-bottom: 1px solid var(--edge);
 	background: var(--panel);
 	flex: none;
+	flex-wrap: wrap;
 }
 header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .2px; }
 header .sp { flex: 1; }
@@ -54,13 +55,15 @@ header .sp { flex: 1; }
 	white-space: nowrap;
 }
 .pill.alarm { color: #fff; background: var(--bad); border-color: var(--bad); }
+.pill.live { color: var(--ok); border-color: #235240; }
 
 main {
 	flex: 1;
 	display: grid;
-	gap: 12px;
-	padding: 12px;
+	gap: 10px;
+	padding: 10px;
 	grid-template-columns: 1fr 1fr;
+	grid-template-rows: minmax(0, 1fr) auto;
 	min-height: 0;
 }
 @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
@@ -80,7 +83,7 @@ main {
 	letter-spacing: .08em;
 	color: var(--dim);
 	margin: 0;
-	padding: 10px 14px;
+	padding: 9px 14px;
 	border-bottom: 1px solid var(--edge);
 	display: flex;
 	align-items: center;
@@ -102,7 +105,7 @@ main {
 #camMsg {
 	position: absolute; inset: 0;
 	display: flex; align-items: center; justify-content: center;
-	padding: 24px;
+	padding: 20px;
 	color: var(--dim); font-size: 13px;
 }
 /* the flex parent only centres; the text itself must be a block, or each
@@ -132,11 +135,12 @@ main {
 .ctl {
 	flex: none;
 	display: flex; align-items: center; gap: 10px;
-	padding: 8px 14px;
+	padding: 7px 14px;
 	border-top: 1px solid var(--edge);
 	font-size: 12px; color: var(--dim);
+	flex-wrap: wrap;
 }
-.ctl input[type=range] { flex: 1; accent-color: var(--accent); }
+.ctl input[type=range] { flex: 1; min-width: 90px; accent-color: var(--accent); }
 button {
 	font: inherit; font-size: 12px;
 	color: var(--fg); background: #1d2534;
@@ -144,6 +148,30 @@ button {
 	padding: 5px 11px; cursor: pointer;
 }
 button:active { background: #263047; }
+button.on { color: #0b0e13; background: var(--ok); border-color: var(--ok); }
+
+#vu {
+	flex: none; width: 88px; height: 8px;
+	background: #1d2534; border-radius: 4px; overflow: hidden;
+}
+#vuFill { height: 100%; width: 0%; background: var(--ok); transition: width .06s linear; }
+
+#canWrap { grid-column: 1 / -1; max-height: 34vh; }
+#canWrap.hidden { display: none; }
+#canTable {
+	flex: 1; overflow: auto; min-height: 0;
+	font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+	padding: 4px 14px 10px;
+}
+#canTable table { border-collapse: collapse; width: 100%; }
+#canTable th {
+	text-align: left; color: var(--dim); font-weight: 500;
+	font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
+	padding: 4px 10px 4px 0; position: sticky; top: 0; background: var(--panel);
+}
+#canTable td { padding: 2px 10px 2px 0; white-space: nowrap; }
+#canTable td.stale, #canTable tr.stale td { color: var(--dim); }
+#canTable .hint { color: var(--dim); padding: 8px 0; font-family: inherit; }
 </style>
 </head>
 <body>
@@ -152,6 +180,7 @@ button:active { background: #263047; }
 	<span class="dot" id="linkDot"></span>
 	<h1>A3004NS-M Sensor Bridge</h1>
 	<span class="sp"></span>
+	<span class="pill" id="feedPill">feed: —</span>
 	<span class="pill" id="profilePill">lidar: —</span>
 	<span class="pill" id="alarmPill">zones: —</span>
 </header>
@@ -165,7 +194,9 @@ button:active { background: #263047; }
 		</div>
 		<div class="ctl">
 			<button id="camReload">스트림 재연결</button>
-			<span id="camHint"></span>
+			<button id="micBtn">🎤 마이크 켜기</button>
+			<div id="vu"><div id="vuFill"></div></div>
+			<span id="micHint"></span>
 		</div>
 	</section>
 
@@ -186,34 +217,41 @@ button:active { background: #263047; }
 			<div class="stat"><div class="k">relayed</div><div class="v" id="sRelay">—</div></div>
 		</div>
 	</section>
+
+	<section class="card hidden" id="canWrap">
+		<h2>CAN<span class="sp"></span><span id="canLabel">—</span></h2>
+		<div id="canTable"></div>
+	</section>
 </main>
 
 <script>
 "use strict";
 
-var STATUS_URL = "ouster.json";
-var POLL_MS = 200;
+var POLL_MS = 250;
+var SSE_PORT = 7603;
+var CAM_PORT = 8080;
+var MIC_PORT = 8082;
 
 var el = function (id) { return document.getElementById(id); };
-var cv = el("lidar"), ctx = cv.getContext("2d");
+var cv = el("lidar"), g2 = cv.getContext("2d");
 var maxRange = 30;
 var state = null;
 var prev = null, prevT = 0;
 var lastGood = 0;
+var base = location.protocol + "//" + (location.hostname || "127.0.0.1");
 
 /* ---------- camera ---------- */
 
 function camUrl() {
 	/* ustreamer listens on :8080 on the router itself, so derive the host
 	   from wherever this page was loaded. Cache-bust on reconnect. */
-	return location.protocol + "//" + location.hostname + ":8080/stream?_=" + Date.now();
+	return base + ":" + CAM_PORT + "/stream?_=" + Date.now();
 }
 
 function camConnect() {
-	var img = el("cam");
 	el("camMsg").style.display = "flex";
 	el("camMsgText").textContent = "스트림 연결 중…";
-	img.src = camUrl();
+	el("cam").src = camUrl();
 }
 
 el("cam").addEventListener("load", function () {
@@ -233,9 +271,117 @@ el("cam").addEventListener("error", function () {
 });
 
 el("camReload").addEventListener("click", camConnect);
-el("camHint").textContent = location.hostname + ":8080";
 
-/* ---------- lidar ---------- */
+/* ---------- microphone ----------
+   Raw PCM through Web Audio rather than an <audio> element: media elements
+   buffer heavily, which is the opposite of what an uncompressed stream is for.
+   Playback must begin from a user gesture, or autoplay policy blocks it and
+   the failure is silent. */
+
+var audio = { ac: null, on: false, at: 0, ctl: null, rate: 16000, ch: 1 };
+var LEAD = 0.08;	/* jitter headroom; the floor is one 10 ms ALSA period */
+
+function micStop() {
+	audio.on = false;
+	if (audio.ctl) { audio.ctl.abort(); audio.ctl = null; }
+	if (audio.ac) { audio.ac.close(); audio.ac = null; }
+	el("micBtn").classList.remove("on");
+	el("micBtn").textContent = "🎤 마이크 켜기";
+	el("vuFill").style.width = "0%";
+}
+
+function micStart() {
+	audio.ctl = new AbortController();
+	el("micHint").textContent = "연결 중…";
+	fetch(base + ":" + MIC_PORT + "/info", { signal: audio.ctl.signal })
+		.then(function (r) { return r.json(); })
+		.then(function (info) {
+			audio.rate = info.rate || 16000;
+			audio.ch = info.channels || 1;
+			audio.ac = new (window.AudioContext || window.webkitAudioContext)();
+			audio.on = true;
+			audio.at = 0;
+			el("micBtn").classList.add("on");
+			el("micBtn").textContent = "🎤 마이크 끄기";
+			el("micHint").textContent = (audio.rate / 1000) + " kHz · " +
+				(audio.ch === 1 ? "mono" : "stereo") + " · PCM";
+			return fetch(base + ":" + MIC_PORT + "/pcm",
+				     { signal: audio.ctl.signal });
+		})
+		.then(function (r) {
+			if (!r.ok || !r.body) throw new Error("no stream");
+			return pump(r.body.getReader());
+		})
+		.catch(function (e) {
+			if (e.name === "AbortError") return;
+			el("micHint").textContent = "마이크 없음 (mic-stream 미실행?)";
+			micStop();
+		});
+}
+
+function pump(reader) {
+	var tail = new Uint8Array(0);
+
+	function step() {
+		return reader.read().then(function (res) {
+			if (res.done || !audio.on) return;
+			var buf = new Uint8Array(tail.length + res.value.length);
+			buf.set(tail, 0);
+			buf.set(res.value, tail.length);
+
+			/* a sample frame must not be split across chunks */
+			var fb = 2 * audio.ch;
+			var usable = Math.floor(buf.length / fb) * fb;
+			tail = buf.slice(usable);
+			if (usable) play(buf.subarray(0, usable));
+			return step();
+		});
+	}
+	return step();
+}
+
+function play(bytes) {
+	var ac = audio.ac;
+	if (!ac) return;
+
+	var dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	var n = bytes.byteLength / 2 / audio.ch;
+	var ab = ac.createBuffer(audio.ch, n, audio.rate);
+	var peak = 0, i, c, v, out;
+
+	for (c = 0; c < audio.ch; c++) {
+		out = ab.getChannelData(c);
+		for (i = 0; i < n; i++) {
+			v = dv.getInt16((i * audio.ch + c) * 2, true) / 32768;
+			out[i] = v;
+			if (c === 0) {
+				v = v < 0 ? -v : v;
+				if (v > peak) peak = v;
+			}
+		}
+	}
+
+	var src = ac.createBufferSource();
+	src.buffer = ab;
+	src.connect(ac.destination);
+
+	/* Schedule back-to-back. If we have fallen behind, resync instead of
+	   accumulating an ever-growing delay. */
+	var now = ac.currentTime;
+	if (audio.at < now + 0.005) audio.at = now + LEAD;
+	src.start(audio.at);
+	audio.at += ab.duration;
+
+	el("vuFill").style.width = Math.min(100, peak * 140).toFixed(0) + "%";
+	el("vuFill").style.background = peak > 0.85 ? "var(--bad)" :
+		peak > 0.5 ? "var(--warn)" : "var(--ok)";
+}
+
+el("micBtn").addEventListener("click", function () {
+	if (audio.on) micStop(); else micStart();
+});
+
+/* ---------- lidar ring ---------- */
 
 el("zoom").addEventListener("input", function () {
 	maxRange = +this.value;
@@ -251,56 +397,58 @@ function resize() {
 	draw();
 }
 window.addEventListener("resize", resize);
+if (window.ResizeObserver) {
+	/* The CAN card appears at runtime and re-flows the grid. That changes the
+	   canvas box without firing a window resize, which left the backing store
+	   stale and drew the range circles as ellipses. */
+	new ResizeObserver(resize).observe(cv);
+}
 
 function rangeColor(m) {
 	/* near = red, far = blue, so an approaching object is obvious */
-	var t = Math.min(1, m / maxRange);
-	var h = 8 + t * 210;
-	return "hsl(" + h + ", 85%, 58%)";
+	return "hsl(" + (8 + Math.min(1, m / maxRange) * 210) + ", 85%, 58%)";
 }
 
 function draw() {
 	var w = cv.width, h = cv.height;
 	var cx = w / 2, cy = h / 2;
 	var R = Math.min(w, h) * 0.46;
-	var i, n, ring, a, r, px, py, m;
+	var dpr = window.devicePixelRatio || 1;
+	var i, n, ring, a, r, px, py, m, step, dotR;
 
-	ctx.clearRect(0, 0, w, h);
-	ctx.fillStyle = "#0b0e13";
-	ctx.fillRect(0, 0, w, h);
+	g2.clearRect(0, 0, w, h);
+	g2.fillStyle = "#0b0e13";
+	g2.fillRect(0, 0, w, h);
 
-	/* range rings, one per nice step */
-	var step = maxRange <= 10 ? 2 : maxRange <= 30 ? 5 : maxRange <= 60 ? 10 : 20;
-	ctx.font = (11 * (window.devicePixelRatio || 1)) + "px ui-sans-serif, sans-serif";
-	ctx.textAlign = "left";
+	step = maxRange <= 10 ? 2 : maxRange <= 30 ? 5 : maxRange <= 60 ? 10 : 20;
+	g2.font = (11 * dpr) + "px ui-sans-serif, sans-serif";
+	g2.textAlign = "left";
 	for (m = step; m <= maxRange; m += step) {
-		ctx.beginPath();
-		ctx.arc(cx, cy, R * m / maxRange, 0, Math.PI * 2);
-		ctx.strokeStyle = "#1d2534";
-		ctx.lineWidth = 1;
-		ctx.stroke();
-		ctx.fillStyle = "#3d4859";
-		ctx.fillText(m + "m", cx + 4, cy - R * m / maxRange - 3);
+		g2.beginPath();
+		g2.arc(cx, cy, R * m / maxRange, 0, Math.PI * 2);
+		g2.strokeStyle = "#1d2534";
+		g2.lineWidth = 1;
+		g2.stroke();
+		g2.fillStyle = "#3d4859";
+		g2.fillText(m + "m", cx + 4, cy - R * m / maxRange - 3);
 	}
 
-	/* cross hairs */
-	ctx.strokeStyle = "#1d2534";
-	ctx.beginPath();
-	ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
-	ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R);
-	ctx.stroke();
+	g2.strokeStyle = "#1d2534";
+	g2.beginPath();
+	g2.moveTo(cx - R, cy); g2.lineTo(cx + R, cy);
+	g2.moveTo(cx, cy - R); g2.lineTo(cx, cy + R);
+	g2.stroke();
 
 	if (!state || !state.ring_cm) {
-		ctx.fillStyle = "#8695ab";
-		ctx.textAlign = "center";
-		ctx.fillText("lidar 데이터 없음", cx, cy + R + 22);
+		g2.fillStyle = "#8695ab";
+		g2.textAlign = "center";
+		g2.fillText("lidar 데이터 없음", cx, cy + R + 22);
 		return;
 	}
 
 	ring = state.ring_cm;
 	n = ring.length;
-	var dpr = window.devicePixelRatio || 1;
-	var dotR = Math.max(1.5 * dpr, R * 2 * Math.PI / n * 0.42);
+	dotR = Math.max(1.5 * dpr, R * 2 * Math.PI / n * 0.42);
 
 	for (i = 0; i < n; i++) {
 		if (ring[i] < 0) continue;
@@ -311,20 +459,17 @@ function draw() {
 		r = R * m / maxRange;
 		px = cx + Math.cos(a) * r;
 		py = cy + Math.sin(a) * r;
-		ctx.beginPath();
-		ctx.arc(px, py, dotR, 0, Math.PI * 2);
-		ctx.fillStyle = rangeColor(m);
-		ctx.fill();
+		g2.beginPath();
+		g2.arc(px, py, dotR, 0, Math.PI * 2);
+		g2.fillStyle = rangeColor(m);
+		g2.fill();
 	}
 
-	/* sensor origin */
-	ctx.beginPath();
-	ctx.arc(cx, cy, 3 * dpr, 0, Math.PI * 2);
-	ctx.fillStyle = "#e6ecf5";
-	ctx.fill();
+	g2.beginPath();
+	g2.arc(cx, cy, 3 * dpr, 0, Math.PI * 2);
+	g2.fillStyle = "#e6ecf5";
+	g2.fill();
 }
-
-/* ---------- polling ---------- */
 
 function setStat(id, val, cls) {
 	var e = el(id);
@@ -333,7 +478,7 @@ function setStat(id, val, cls) {
 }
 
 function onStatus(s) {
-	var now = Date.now(), dt, near, i;
+	var now = Date.now(), dt, near = Infinity, i;
 
 	lastGood = now;
 	el("linkDot").className = "dot on";
@@ -354,7 +499,6 @@ function onStatus(s) {
 	setStat("sMiss", s.missed_columns,
 		s.missed_columns > 0 ? (s.missed_columns > 1000 ? "bad" : "warn") : "");
 
-	near = Infinity;
 	if (s.ring_cm) {
 		for (i = 0; i < s.ring_cm.length; i++)
 			if (s.ring_cm[i] >= 0 && s.ring_cm[i] < near) near = s.ring_cm[i];
@@ -362,8 +506,7 @@ function onStatus(s) {
 	setStat("sNear", near === Infinity ? "—" : (near / 100).toFixed(2) + " m",
 		near / 100 < 2 ? "warn" : "");
 
-	el("profilePill").textContent =
-		"lidar: " + s.channels + "ch · " + s.profile;
+	el("profilePill").textContent = "lidar: " + s.channels + "ch · " + s.profile;
 
 	var ap = el("alarmPill");
 	if (s.zone_alarm) {
@@ -378,24 +521,96 @@ function onStatus(s) {
 	draw();
 }
 
-function poll() {
-	fetch(STATUS_URL, { cache: "no-store" })
+function goStale() {
+	if (Date.now() - lastGood > 3000) {
+		el("linkDot").className = "dot off";
+		el("profilePill").textContent = "lidar: 없음";
+		state = null;
+		draw();
+	}
+}
+
+/* Push first, poll only as a fallback. ouster-edge emits one SSE event per
+   revolution, so the ring arrives when it exists rather than up to a poll
+   interval later - measured at well under a millisecond versus 200 ms+. */
+var sse = null, polling = null;
+
+function startPolling() {
+	if (polling) return;
+	el("feedPill").textContent = "feed: polling";
+	el("feedPill").className = "pill";
+	polling = setInterval(function () {
+		fetch("ouster.json", { cache: "no-store" })
+			.then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+			.then(onStatus)
+			.catch(goStale);
+	}, POLL_MS);
+}
+
+function startSSE() {
+	try {
+		sse = new EventSource(base + ":" + SSE_PORT + "/");
+	} catch (e) {
+		startPolling();
+		return;
+	}
+	sse.onopen = function () {
+		el("feedPill").textContent = "feed: push";
+		el("feedPill").className = "pill live";
+		if (polling) { clearInterval(polling); polling = null; }
+	};
+	sse.onmessage = function (ev) {
+		try { onStatus(JSON.parse(ev.data)); } catch (e) { /* ignore */ }
+	};
+	sse.onerror = function () {
+		/* EventSource retries by itself; poll meanwhile so the page still
+		   shows something when SSE is blocked or the daemon is down. */
+		goStale();
+		startPolling();
+	};
+	setTimeout(function () { if (!lastGood) startPolling(); }, 1500);
+}
+
+/* ---------- CAN telemetry ---------- */
+
+function canPoll() {
+	fetch("can.json", { cache: "no-store" })
 		.then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
-		.then(onStatus)
-		.catch(function () {
-			if (Date.now() - lastGood > 3000) {
-				el("linkDot").className = "dot off";
-				el("profilePill").textContent = "lidar: 없음";
-				state = null;
-				draw();
+		.then(function (c) {
+			var ids = Object.keys(c.frames || {}).sort();
+			var html, f, stale;
+
+			el("canWrap").classList.remove("hidden");
+			el("canLabel").textContent = c.interface + " · rx " + c.rx +
+				(c.inject_allowed ? " · INJECT ENABLED" : " · read-only");
+
+			if (!ids.length) {
+				el("canTable").innerHTML = "<div class=\"hint\">" +
+					"추적 중인 ID 없음. <code>option discover 1</code> 로 " +
+					"차량이 실제로 보내는 ID 를 먼저 찾으세요.</div>";
+				return;
 			}
-		});
+
+			html = "<table><thead><tr><th>ID</th><th>DATA</th>" +
+			       "<th>COUNT</th><th>AGE</th></tr></thead><tbody>";
+			ids.forEach(function (id) {
+				f = c.frames[id];
+				stale = f.age_ms > 1000 ? " class=\"stale\"" : "";
+				html += "<tr" + stale + "><td>0x" + id + "</td><td>" +
+					(f.data.match(/../g) || []).join(" ") +
+					"</td><td>" + f.count + "</td><td>" +
+					f.age_ms + " ms</td></tr>";
+			});
+			el("canTable").innerHTML = html + "</tbody></table>";
+		})
+		.catch(function () { el("canWrap").classList.add("hidden"); });
 }
 
 resize();
 camConnect();
-poll();
-setInterval(poll, POLL_MS);
+startSSE();
+canPoll();
+setInterval(canPoll, 500);
 </script>
 </body>
 </html>

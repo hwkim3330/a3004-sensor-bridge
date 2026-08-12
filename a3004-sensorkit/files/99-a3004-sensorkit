@@ -14,13 +14,14 @@ set ustreamer.video0.device='/dev/video0'
 set ustreamer.video0.resolution='1280x720'
 set ustreamer.video0.format='MJPEG'
 set ustreamer.video0.encoder='CPU'
-set ustreamer.video0.desired_fps='30'
+set ustreamer.video0.desired_fps='60'
 set ustreamer.video0.quality='80'
 set ustreamer.video0.host='0.0.0.0'
 set ustreamer.video0.port='8080'
-set ustreamer.video0.drop_same_frames='30'
-set ustreamer.video0.buffers='3'
+set ustreamer.video0.drop_same_frames='0'
+set ustreamer.video0.buffers='2'
 set ustreamer.video0.workers='2'
+set ustreamer.video0.tcp_nodelay='1'
 commit ustreamer
 EOF
 
@@ -48,14 +49,15 @@ EOF
 fi
 
 # --- firewall -------------------------------------------------------------
-# The camera stream and the dashboard are LAN-only. Nothing is opened on WAN.
+# Camera (8080), lidar ring push (7603) and microphone (8082) are LAN-only.
+# Nothing is opened on WAN.
 if ! uci -q get firewall.sensorkit_stream >/dev/null; then
 	uci -q batch <<'EOF'
 set firewall.sensorkit_stream=rule
-set firewall.sensorkit_stream.name='Allow-MJPEG-LAN'
+set firewall.sensorkit_stream.name='Allow-SensorKit-LAN'
 set firewall.sensorkit_stream.src='lan'
 set firewall.sensorkit_stream.proto='tcp'
-set firewall.sensorkit_stream.dest_port='8080'
+set firewall.sensorkit_stream.dest_port='7603 8080 8082'
 set firewall.sensorkit_stream.target='ACCEPT'
 commit firewall
 EOF
@@ -81,6 +83,15 @@ if [ -z "$band1" ]; then
 fi
 
 uci -q commit wireless
+
+# --- microphone -----------------------------------------------------------
+# The StreamCam only offers stereo, so hw: with mono fails outright; plughw
+# lets ALSA downmix. On the router the USB card is the only card, so index 0.
+uci -q batch <<'EOF'
+set mic-stream.capture.enabled='1'
+set mic-stream.capture.device='plughw:0,0'
+commit mic-stream
+EOF
 
 logger -t sensorkit "sensor bridge configured; dashboard at http://192.168.1.1/sensors/"
 exit 0

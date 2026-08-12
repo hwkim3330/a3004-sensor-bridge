@@ -12,6 +12,9 @@ cat > .config <<'EOF'
 CONFIG_TARGET_ramips=y
 CONFIG_TARGET_ramips_mt7621=y
 CONFIG_TARGET_ramips_mt7621_DEVICE_iptime_a3004ns-m=y
+CONFIG_PACKAGE_kmod-video-core=y
+CONFIG_PACKAGE_kmod-video-uvc=y
+CONFIG_PACKAGE_kmod-usb-audio=y
 CONFIG_PACKAGE_a3004-sensorkit=y
 CONFIG_PACKAGE_luci=y
 CONFIG_PACKAGE_luci-app-ustreamer=y
@@ -24,6 +27,19 @@ make -j$(nproc)
 Build host needs GNU awk, not mawk (`apt install gawk`) — mawk silently breaks
 the feed metadata scan with `function asort never defined`, and the symptom is
 feed packages appearing not to exist.
+
+`kmod-video-core` and `kmod-usb-audio` are listed explicitly on purpose.
+OpenWrt's metadata generator turns some kmod dependencies into a plain
+`depends on PACKAGE_x` rather than a `select`, and `kmod-usb-audio` cannot be a
+dependency of `mic-stream` at all without closing a kconfig recursion through
+`alsa-lib`. If they are missing, kconfig **silently drops a3004-sensorkit from
+.config** and you get an image that builds fine and contains no dashboard. If
+`make defconfig` prints `recursive dependency detected`, that is what happened —
+check the package is still selected afterwards:
+
+```sh
+grep '^CONFIG_PACKAGE_a3004-sensorkit=y' .config || echo "dropped!"
+```
 
 Output lands in `bin/targets/ramips/mt7621/`.
 
@@ -92,11 +108,34 @@ Read the `VERDICT` line. Everything about the camera path depends on it:
   single-digit fps, and treat that as the ceiling. A camera with a hardware
   JPEG encoder is the fix, not tuning.
 
-I could not settle this from documentation. Logitech's spec sheet lists MJPEG,
-NV12 and YUY2 for the StreamCam, but there are credible reports of the
-StreamCam exposing no MJPEG at all over UVC on Linux, and I have no VU0054 to
-test. `sensor-probe` gives the real answer in one line — run it before
-committing to a resolution.
+For the Logitech StreamCam specifically, this is now settled by measurement
+rather than by the datasheet. A VU0054 (`046d:0893`) was plugged into a PC and
+probed: it enumerates at USB 3.0 SuperSpeed and **does** offer MJPEG, at every
+resolution up to 1920x1080, at both 30 and 60 fps.
+
+```
+Compressed: mjpeg : 640x480 ... 1280x720 1920x1080
+Raw       : yuyv422 : ... 2304x1296
+Raw       : nv12    : 640x480 640x360 1280x720 1920x1080
+```
+
+Measured bitrate with `-c copy`, so no re-encoding:
+
+| mode | Mbit/s |
+|---|---|
+| 1280x720 @ 30 | 19.0 |
+| 1280x720 @ 60 | 39.6 |
+| 1920x1080 @ 30 | 39.4 |
+| 1920x1080 @ 60 | 82.9 |
+
+The shipped default is **1280x720 @ 60**: 60 fps halves the frame interval to
+16.7 ms, which was the point of the exercise, and 39.6 Mbit/s leaves room for
+the lidar on the same 5 GHz link. 1080p30 costs the same bandwidth with twice
+the latency, so pick it only if resolution matters more.
+
+Run `sensor-probe` anyway if you use a different camera — the reports of
+StreamCams with no MJPEG on Linux may well be true of other revisions, and the
+whole plan changes if it is.
 
 ```sh
 /etc/init.d/ustreamer start
@@ -149,12 +188,57 @@ while :; do sed -n 's/.*"missed_columns": \([0-9]*\).*/\1/p' \
     /var/run/ouster-edge.json; sleep 2; done
 ```
 
+## 5b. Microphone
+
+The StreamCam's microphone is a separate USB audio device on the same cable.
+It is served as uncompressed PCM — 16 kHz mono is 256 kbit/s, and no codec means
+no encoder delay.
+
+```sh
+cat /proc/asound/cards          # the USB card should be index 0 on the router
+/etc/init.d/mic-stream start
+curl -s http://192.168.1.1:8082/info
+```
+
+The config uses `plughw:0,0`, not `hw:0,0`: the StreamCam only offers **stereo**,
+so asking `hw:` for mono fails outright with `Channels count non available`.
+`plughw` lets ALSA downmix, which halves the bandwidth for no measurable cost.
+
+Verified on the bench with the real camera: exactly 32000 B/s at 16 kHz mono,
+a valid WAV header on `/wav`, 3.00 s of audio in 3 s, and real signal rather
+than silence.
+
+In the dashboard, press **마이크 켜기**. Playback has to start from a user
+gesture — browser autoplay policy blocks it otherwise, and it fails silently.
+
+## 5c. CAN (optional)
+
+Requires a USB-CAN adapter and a USB hub, because the camera already owns the
+single USB port. See `CAN.md` for wiring, bus termination and why injection is
+off by default.
+
+```sh
+can-up can0 500000
+uci set can-bridge.bus.enabled='1'
+uci set can-bridge.bus.discover='1'
+uci commit can-bridge && /etc/init.d/can-bridge start
+logread -e can-bridge           # discovered ids appear here
+```
+
 ## 6. Dashboard
 
-`http://192.168.1.1/sensors/` — camera and lidar ring side by side. Join the
-router's 5 GHz AP from an Android tablet and open that URL; nothing else is
-needed. The page is plain HTML/CSS/JS with no external resources, so it works
-with no internet on either side.
+`http://192.168.1.1/sensors/` — camera, lidar ring, microphone and CAN in one
+page. Join the router's 5 GHz AP from an Android tablet and open that URL;
+nothing else is needed. The page is plain HTML/CSS/JS with no external
+resources, so it works with no internet on either side.
+
+The **feed** pill in the header shows `push` when the ring is arriving over
+Server-Sent Events and `polling` when it has fallen back to fetching the status
+file. Push is 0.2–0.7 ms behind the revolution; polling is 200–450 ms. If it
+says polling, port 7603 is not reachable.
+
+Verified on a Galaxy Tab S7 FE with a live camera, a live microphone, synthetic
+lidar traffic and real SocketCAN frames.
 
 ## 7. Optional: hand the raw stream to ROS 2
 
@@ -199,7 +283,12 @@ Built and verified here:
 - `ouster-edge` compiles warning-free with `-Wall -Wextra`, and its packet
   layout arithmetic matches Ouster's documented sizes (12608 B legacy,
   12544 B single-return, 4352 B low-rate, 16640 B dual, all at 64×16)
-- the dashboard renders
+- the dashboard renders on a real tablet, with a live camera stream, and the
+  CAN and lidar panels updating
+- the camera's formats, bitrates and microphone were measured on the real
+  StreamCam plugged into a PC
+- `can-bridge` was verified against `vcan` interfaces, including that injection
+  is refused by default
 
 Not tested, because it needs the hardware:
 
