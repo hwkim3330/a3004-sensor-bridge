@@ -63,9 +63,23 @@ main {
 	gap: 10px;
 	padding: 10px;
 	grid-template-columns: 1fr 1fr;
-	grid-template-rows: minmax(0, 1fr) auto;
+	grid-auto-rows: auto;
+	align-content: start;
 	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior: contain;
 }
+/* A definite height for the first row, not a minimum: the camera <img> and the
+   lidar <canvas> are both height:100%, which against an auto-sized row resolves
+   to their natural size and inflates it. */
+main > .card:nth-child(1),
+main > .card:nth-child(2) { height: min(52vh, 460px); }
+
+/* The secondary panels need a floor of their own. Their bodies are content-sized
+   now, but relying on that alone left them collapsed to just a header. */
+#tlWrap { min-height: 216px; }
+#rcWrap { min-height: 116px; }
+#canWrap { min-height: 132px; }
 @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
 
 .card {
@@ -156,12 +170,43 @@ button.on { color: #0b0e13; background: var(--ok); border-color: var(--ok); }
 }
 #vuFill { height: 100%; width: 0%; background: var(--ok); transition: width .06s linear; }
 
-#canWrap { grid-column: 1 / -1; max-height: 34vh; }
-#canWrap.hidden, #rcWrap.hidden { display: none; }
+#canWrap { grid-column: 1 / -1; }
+#canWrap.hidden, #rcWrap.hidden, #tlWrap.hidden { display: none; }
+
+#tlWrap { grid-column: 1 / -1; }
+.tlBody { flex: none; display: flex; gap: 16px; padding: 12px 14px; align-items: center; flex-wrap: wrap; }
+#stick {
+	width: 168px; height: 168px; flex: none;
+	border-radius: 50%; background: #10151d;
+	border: 1px solid var(--edge);
+	position: relative; touch-action: none; cursor: grab;
+}
+#stick::before {
+	content: ""; position: absolute; inset: 49% 8%;
+	border-top: 1px solid #1d2534;
+}
+#stick::after {
+	content: ""; position: absolute; inset: 8% 49%;
+	border-left: 1px solid #1d2534;
+}
+#knob {
+	position: absolute; left: 50%; top: 50%;
+	width: 52px; height: 52px; margin: -26px 0 0 -26px;
+	border-radius: 50%; background: #2b3547;
+	border: 1px solid #3d4859;
+	transition: background .1s;
+}
+#tlWrap.armed #knob { background: var(--ok); border-color: var(--ok); }
+.tlSide { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.tlNum { display: flex; gap: 10px; font-size: 12px; color: var(--dim); align-items: baseline; }
+.tlNum b { color: var(--fg); font: 14px/1 ui-monospace, monospace;
+	font-variant-numeric: tabular-nums; }
+.tlNote { font-size: 11px; color: var(--dim); line-height: 1.5; }
+#armBtn { align-self: flex-start; padding: 7px 16px; font-weight: 600; }
 
 #rcWrap { grid-column: 1 / -1; }
 #rcBars {
-	flex: 1; overflow: auto; min-height: 0;
+	flex: none;
 	padding: 8px 14px 12px;
 	display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
 	gap: 4px 16px;
@@ -183,7 +228,7 @@ button.on { color: #0b0e13; background: var(--ok); border-color: var(--ok); }
 	font: 12px/1 ui-monospace, monospace; font-variant-numeric: tabular-nums; }
 #rcWrap.lost .rcRow .fill { background: var(--dim); }
 #canTable {
-	flex: 1; overflow: auto; min-height: 0;
+	flex: none; max-height: 30vh; overflow: auto;
 	font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
 	padding: 4px 14px 10px;
 }
@@ -239,6 +284,20 @@ button.on { color: #0b0e13; background: var(--ok); border-color: var(--ok); }
 			<div class="stat"><div class="k">missed cols</div><div class="v" id="sMiss">—</div></div>
 			<div class="stat"><div class="k">nearest</div><div class="v" id="sNear">—</div></div>
 			<div class="stat"><div class="k">relayed</div><div class="v" id="sRelay">—</div></div>
+		</div>
+	</section>
+
+	<section class="card hidden" id="tlWrap">
+		<h2>Teleop<span class="sp"></span><span id="tlLabel">—</span></h2>
+		<div class="tlBody">
+			<div id="stick"><div id="knob"></div></div>
+			<div class="tlSide">
+				<button id="armBtn">ARM</button>
+				<div class="tlNum"><span>전진/후진</span><b id="tlY">0.00</b></div>
+				<div class="tlNum"><span>좌/우</span><b id="tlX">0.00</b></div>
+				<div class="tlNum"><span>deadman</span><b id="tlAge">—</b></div>
+				<div class="tlNote" id="tlNote"></div>
+			</div>
 		</div>
 	</section>
 
@@ -666,6 +725,107 @@ function rcPoll() {
 		.catch(function () { el("rcWrap").classList.add("hidden"); });
 }
 
+/* ---------- teleop ----------
+   Sends intent to the daemon, which is what enforces the deadman. The page
+   deliberately keeps sending while armed even when the stick is centred: going
+   quiet is indistinguishable from a lost link, and the daemon must be able to
+   tell the difference. */
+
+var tl = { armed: false, x: 0, y: 0, seq: 0, timer: null, dragging: false,
+	   armedAt: 0 };
+
+function tlSend() {
+	tl.seq++;
+	var q = "cmd?s=" + tl.seq + "&arm=" + (tl.armed ? 1 : 0) +
+		"&a0=" + Math.round(tl.x * 10000) +
+		"&a1=" + Math.round(tl.y * 10000);
+	fetch(base + ":8083/" + q, { cache: "no-store" })
+		.catch(function () { /* the daemon's deadman handles this */ });
+}
+
+function tlSetArmed(on) {
+	tl.armed = on;
+	if (on) tl.armedAt = Date.now();
+	el("tlWrap").classList.toggle("armed", on);
+	el("armBtn").classList.toggle("on", on);
+	el("armBtn").textContent = on ? "DISARM" : "ARM";
+	if (on) {
+		tlSend();                      /* do not wait 50 ms to arm */
+		if (!tl.timer) tl.timer = setInterval(tlSend, 50);
+	} else {
+		tlSend();                      /* disarm immediately, do not wait */
+		if (tl.timer) { clearInterval(tl.timer); tl.timer = null; }
+		tlCentre();
+	}
+}
+
+function tlCentre() {
+	tl.x = 0; tl.y = 0;
+	el("knob").style.transform = "translate(0,0)";
+	el("tlX").textContent = "0.00";
+	el("tlY").textContent = "0.00";
+}
+
+function tlMove(ev) {
+	if (!tl.dragging) return;
+	var r = el("stick").getBoundingClientRect();
+	var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+	var p = ev.touches ? ev.touches[0] : ev;
+	var dx = p.clientX - cx, dy = p.clientY - cy;
+	var lim = r.width / 2 - 26;
+	var d = Math.sqrt(dx * dx + dy * dy);
+
+	if (d > lim) { dx *= lim / d; dy *= lim / d; }
+	tl.x = dx / lim;
+	tl.y = -dy / lim;                  /* up is forward */
+	el("knob").style.transform = "translate(" + dx.toFixed(0) + "px," +
+		dy.toFixed(0) + "px)";
+	el("tlX").textContent = tl.x.toFixed(2);
+	el("tlY").textContent = tl.y.toFixed(2);
+	ev.preventDefault();
+}
+
+(function () {
+	var st = el("stick");
+
+	function down(ev) { tl.dragging = true; tlMove(ev); }
+	function up() { tl.dragging = false; tlCentre(); }
+
+	st.addEventListener("pointerdown", down);
+	st.addEventListener("pointermove", tlMove);
+	window.addEventListener("pointerup", up);
+	window.addEventListener("pointercancel", up);
+	/* Losing the tab is exactly the case the deadman exists for, but disarming
+	   on the way out is better than relying on it. */
+	document.addEventListener("visibilitychange", function () {
+		if (document.hidden && tl.armed) tlSetArmed(false);
+	});
+	el("armBtn").addEventListener("click", function () { tlSetArmed(!tl.armed); });
+})();
+
+function tlPoll() {
+	fetch("teleop.json", { cache: "no-store" })
+		.then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+		.then(function (t) {
+			el("tlWrap").classList.remove("hidden");
+			el("tlLabel").textContent = (t.armed ? "ARMED" : "disarmed") +
+				" · " + t.rate_hz + " Hz · " +
+				(t.forwarding ? "forwarding" : "not forwarding") +
+				(t.deadman_trips ? " · " + t.deadman_trips + " deadman" : "");
+			el("tlAge").textContent = t.age_ms + " / " + t.timeout_ms + " ms";
+			/* If the daemon disarmed underneath us, reflect it - but only on
+			   its own evidence. The status file is a snapshot up to its write
+			   interval old, so a plain "armed: false" right after we armed is
+			   simply a stale read, and acting on it disarmed us instantly. */
+			if (!t.armed && tl.armed &&
+			    (t.age_ms >= t.timeout_ms || Date.now() - tl.armedAt > 800))
+				tlSetArmed(false);
+			el("tlNote").textContent = t.forwarding ? "" :
+				"remote 미설정 — 조작값이 아무 데도 전달되지 않습니다";
+		})
+		.catch(function () { el("tlWrap").classList.add("hidden"); });
+}
+
 resize();
 camConnect();
 startSSE();
@@ -673,6 +833,8 @@ canPoll();
 setInterval(canPoll, 500);
 rcPoll();
 setInterval(rcPoll, 200);
+tlPoll();
+setInterval(tlPoll, 300);
 </script>
 </body>
 </html>

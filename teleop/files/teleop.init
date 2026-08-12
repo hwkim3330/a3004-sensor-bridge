@@ -1,0 +1,44 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=05
+USE_PROCD=1
+
+PROG=/usr/sbin/teleop
+
+start_service() {
+	local enabled port remote rate timeout
+
+	config_load teleop
+	config_get_bool enabled control enabled 0
+	[ "$enabled" = "1" ] || return 0
+
+	config_get port    control port 8083
+	config_get remote  control remote
+	config_get rate    control rate 20
+	config_get timeout control timeout 300
+
+	procd_open_instance
+	procd_set_param command "$PROG" \
+		--port "$port" \
+		--rate "$rate" \
+		--timeout "$timeout" \
+		--status /var/run/teleop.json
+
+	[ -n "$remote" ] && procd_append_param command --remote "$remote"
+
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	[ -n "$remote" ] && logger -t teleop "forwarding control intent to $remote"
+}
+
+stop_service() {
+	rm -f /var/run/teleop.json
+}
+
+service_triggers() {
+	procd_add_reload_trigger "teleop"
+}

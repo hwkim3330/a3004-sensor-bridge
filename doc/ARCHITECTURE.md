@@ -65,6 +65,7 @@ UDP on a 100 Mbit link has no headroom for retransmit-free delivery.
 | Microphone pass-through (`mic-stream`) | negligible; 32 kB/s copied, no codec |
 | CAN bridge | negligible; a busy 500 kbps bus is under 4000 frames/s |
 | i-BUS RC decode | negligible; 32 bytes every 7.5 ms |
+| teleop | negligible; 20 commands in and 20 datagrams out per second |
 | **IP fragment reassembly at 1500 MTU** | **the real cost** — see below |
 
 12544-byte datagrams do not fit a 1500-byte MTU, so each one arrives as nine
@@ -113,7 +114,9 @@ parse better. So the router forwards raw and computes only things that are
 6. **Reads RC input**, if a FlySky receiver's i-BUS output is wired to a
    USB-serial adapter. Not the RF — see `RC-AND-WIFI.md` for why no WiFi chip
    can demodulate AFHDS 2A.
-7. **Hosts a dashboard** on port 80 that renders the camera, the ring, the
+7. **Passes control intent** from a tablet joystick to whatever holds the loop,
+   with a deadman at each end. It runs no control loop itself — see `TELEOP.md`.
+8. **Hosts a dashboard** on port 80 that renders the camera, the ring, the
    microphone, CAN telemetry and the RC channels, so a tablet on the router's
    own WiFi is a complete client with no other machine involved.
 

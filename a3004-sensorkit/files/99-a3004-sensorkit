@@ -49,7 +49,8 @@ EOF
 fi
 
 # --- firewall -------------------------------------------------------------
-# Camera (8080), lidar ring push (7603) and microphone (8082) are LAN-only.
+# Camera (8080), lidar ring push (7603), microphone (8082) and teleop
+# (8083) are LAN-only.
 # Nothing is opened on WAN.
 if ! uci -q get firewall.sensorkit_stream >/dev/null; then
 	uci -q batch <<'EOF'
@@ -57,7 +58,7 @@ set firewall.sensorkit_stream=rule
 set firewall.sensorkit_stream.name='Allow-SensorKit-LAN'
 set firewall.sensorkit_stream.src='lan'
 set firewall.sensorkit_stream.proto='tcp'
-set firewall.sensorkit_stream.dest_port='7603 8080 8082'
+set firewall.sensorkit_stream.dest_port='7603 8080 8082 8083'
 set firewall.sensorkit_stream.target='ACCEPT'
 commit firewall
 EOF

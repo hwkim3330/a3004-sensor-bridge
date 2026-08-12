@@ -18,6 +18,7 @@ is fixed here — see `doc/DBDC.md`.
 | [`doc/DBDC.md`](doc/DBDC.md) | why the upstream port was never merged, and the fix |
 | [`doc/CAN.md`](doc/CAN.md) | USB-CAN wiring, bus termination, and why injection is off by default |
 | [`doc/RC-AND-WIFI.md`](doc/RC-AND-WIFI.md) | why no WiFi chip can receive FlySky AFHDS 2A, what to do instead, and how many radios and SSIDs the DBDC fix buys |
+| [`doc/TELEOP.md`](doc/TELEOP.md) | why a tablet cannot emulate a 2.4 GHz transmitter, and how it drives things over IP instead — with two independent deadmen |
 | [`doc/RING-FORMAT.md`](doc/RING-FORMAT.md) | the lidar range-ring wire format and JSON status |
 
 ## Packages
@@ -29,9 +30,12 @@ is fixed here — see `doc/DBDC.md`.
 | `mic-stream` | serves a USB microphone as uncompressed PCM over HTTP |
 | `can-bridge` | bridges a SocketCAN interface to UDP, read-only unless told otherwise |
 | `rc-ibus` | decodes a FlySky receiver's i-BUS channel output |
+| `teleop` | takes joystick intent from the dashboard and forwards it with a deadman |
 
 `doc/pc-side/ring_to_laserscan.py` republishes the ring as
 `sensor_msgs/LaserScan` on a machine with ROS 2.
+`doc/pc-side/teleop_receiver.py` is the reference control receiver, and the
+place to look for how the second deadman is meant to work.
 
 ## Tests
 
@@ -56,6 +60,10 @@ python3 test_bridge.py
 cd ../../rc-ibus/test
 cc -O2 -Wall -Wextra -o rc-ibus ../src/rc-ibus.c
 python3 test_ibus.py           # i-BUS over a pty
+
+cd ../../teleop/test
+cc -O2 -Wall -Wextra -o teleop ../src/teleop.c
+python3 test_teleop.py         # arming, deadman, replay rejection, shutdown
 ```
 
 If you run these repeatedly, note that a daemon left behind by an aborted run
@@ -77,6 +85,8 @@ Measured or exercised here:
 - its microphone: exact byte rate, valid WAV, real signal
 - `can-bridge` against `vcan`, including refusal to inject
 - `rc-ibus` against synthesised i-BUS frames over a pty
+- `teleop`: 30 safety checks, plus end to end from the tablet's joystick through
+  the daemon to the reference receiver, with both deadmen firing
 - `ring_to_laserscan.py` under ROS 2 jazzy
 - the dashboard on a Galaxy Tab S7 FE with camera, microphone, lidar, CAN and
   RC all live at once
@@ -87,4 +97,6 @@ Still needs the hardware:
 - a real OS-64: throughput, and whether MT7621 accepts a 9000-byte MTU
 - a real USB-CAN adapter enumerating and `gs_usb` binding on mipsel
 - a real FlySky receiver emitting the frame layout the decoder assumes
+- anything actually being driven by teleop; the deadmen bound how long a runaway
+  lasts, not whether one can happen
 - the antenna split the EEPROM reports (2×2+2×2 expected, unread)
