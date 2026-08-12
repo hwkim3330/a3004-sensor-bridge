@@ -64,6 +64,7 @@ UDP on a 100 Mbit link has no headroom for retransmit-free delivery.
 | MJPEG pass-through (`ustreamer`) | small; USB DMA in, socket out, no encode |
 | Microphone pass-through (`mic-stream`) | negligible; 32 kB/s copied, no codec |
 | CAN bridge | negligible; a busy 500 kbps bus is under 4000 frames/s |
+| i-BUS RC decode | negligible; 32 bytes every 7.5 ms |
 | **IP fragment reassembly at 1500 MTU** | **the real cost** — see below |
 
 12544-byte datagrams do not fit a 1500-byte MTU, so each one arrives as nine
@@ -109,9 +110,12 @@ parse better. So the router forwards raw and computes only things that are
    the sensor rather than a machine across a WiFi link.
 5. **Relays.** The raw stream is forwarded verbatim to a real machine when one
    is present, so nothing is lost by putting the router in the path.
-6. **Hosts a dashboard** on port 80 that renders the camera, the ring, the
-   microphone and CAN telemetry, so a tablet on the router's own WiFi is a
-   complete client with no other machine involved.
+6. **Reads RC input**, if a FlySky receiver's i-BUS output is wired to a
+   USB-serial adapter. Not the RF — see `RC-AND-WIFI.md` for why no WiFi chip
+   can demodulate AFHDS 2A.
+7. **Hosts a dashboard** on port 80 that renders the camera, the ring, the
+   microphone, CAN telemetry and the RC channels, so a tablet on the router's
+   own WiFi is a complete client with no other machine involved.
 
 ## Latency
 
@@ -124,6 +128,7 @@ part will be slower, but the structure is what matters:
 | completed revolution → dashboard | **0.2–0.7 ms** | pushed as Server-Sent Events. Polling the status file costs up to one write interval plus one poll interval, so 200–450 ms |
 | camera frame interval | 16.7 ms | 60 fps rather than 30, with `drop_same_frames` off and `tcp_nodelay` on |
 | microphone | one ALSA period, 10 ms | no codec, so no encoder delay; the browser adds ~80 ms of jitter buffer |
+| RC channel → status file | ≤100 ms | one i-BUS frame is 7.5 ms; the status interval dominates |
 
 The lidar itself sets the floor for anything ring-shaped: a revolution at 10 Hz
 is 100 ms. Running the sensor at 20 Hz halves that and doubles the bandwidth to

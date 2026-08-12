@@ -157,7 +157,31 @@ button.on { color: #0b0e13; background: var(--ok); border-color: var(--ok); }
 #vuFill { height: 100%; width: 0%; background: var(--ok); transition: width .06s linear; }
 
 #canWrap { grid-column: 1 / -1; max-height: 34vh; }
-#canWrap.hidden { display: none; }
+#canWrap.hidden, #rcWrap.hidden { display: none; }
+
+#rcWrap { grid-column: 1 / -1; }
+#rcBars {
+	flex: 1; overflow: auto; min-height: 0;
+	padding: 8px 14px 12px;
+	display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+	gap: 4px 16px;
+}
+.rcRow { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.rcRow .n { color: var(--dim); width: 2.2em; flex: none;
+	font: 11px/1 ui-monospace, monospace; }
+.rcRow .bar {
+	flex: 1; height: 8px; background: #1d2534; border-radius: 4px;
+	position: relative; overflow: hidden;
+}
+/* centre tick: RC sticks rest at 1500, so the midpoint is the reference */
+.rcRow .bar::after {
+	content: ""; position: absolute; left: 50%; top: 0; bottom: 0;
+	width: 1px; background: #3d4859;
+}
+.rcRow .fill { display: block; height: 100%; background: var(--accent); }
+.rcRow .v { width: 3.4em; text-align: right; flex: none;
+	font: 12px/1 ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+#rcWrap.lost .rcRow .fill { background: var(--dim); }
 #canTable {
 	flex: 1; overflow: auto; min-height: 0;
 	font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -216,6 +240,11 @@ button.on { color: #0b0e13; background: var(--ok); border-color: var(--ok); }
 			<div class="stat"><div class="k">nearest</div><div class="v" id="sNear">—</div></div>
 			<div class="stat"><div class="k">relayed</div><div class="v" id="sRelay">—</div></div>
 		</div>
+	</section>
+
+	<section class="card hidden" id="rcWrap">
+		<h2>RC (i-BUS)<span class="sp"></span><span id="rcLabel">—</span></h2>
+		<div id="rcBars"></div>
 	</section>
 
 	<section class="card hidden" id="canWrap">
@@ -606,11 +635,44 @@ function canPoll() {
 		.catch(function () { el("canWrap").classList.add("hidden"); });
 }
 
+function rcPoll() {
+	fetch("rc.json", { cache: "no-store" })
+		.then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+		.then(function (rc) {
+			var html = "", i, v, pct;
+
+			el("rcWrap").classList.remove("hidden");
+			/* A stale status file means the daemon died; treat that the
+			   same as a lost link rather than showing frozen sticks. */
+			var lost = !rc.link || rc.age_ms > 1000;
+			el("rcWrap").classList.toggle("lost", lost);
+			el("rcLabel").textContent = (lost ? "LINK LOST" : "link ok") +
+				" · " + rc.frames + " frames" +
+				(rc.bad_crc ? " · " + rc.bad_crc + " bad crc" : "") +
+				(rc.link_losses ? " · " + rc.link_losses + " drops" : "");
+
+			for (i = 0; i < rc.channels.length; i++) {
+				v = rc.channels[i];
+				/* 1000-2000 us is the usable travel of a hobby RC channel */
+				pct = Math.max(0, Math.min(100, (v - 1000) / 10));
+				html += "<div class=\"rcRow\"><span class=\"n\">CH" +
+					(i + 1) + "</span><span class=\"bar\">" +
+					"<span class=\"fill\" style=\"width:" +
+					pct.toFixed(1) + "%\"></span></span>" +
+					"<span class=\"v\">" + v + "</span></div>";
+			}
+			el("rcBars").innerHTML = html;
+		})
+		.catch(function () { el("rcWrap").classList.add("hidden"); });
+}
+
 resize();
 camConnect();
 startSSE();
 canPoll();
 setInterval(canPoll, 500);
+rcPoll();
+setInterval(rcPoll, 200);
 </script>
 </body>
 </html>

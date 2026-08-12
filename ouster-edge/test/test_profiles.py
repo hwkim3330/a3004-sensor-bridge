@@ -8,8 +8,8 @@ what was encoded. This is the only way to verify the parser without a sensor.
 import json, os, socket, struct, subprocess, sys, tempfile, time
 
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("OUSTER_EDGE_BIN", "./ouster-edge")
-PORT = 17502
-RING_PORT = 17602
+PORT = 26502
+RING_PORT = 26602
 STATUS = tempfile.mkstemp(suffix=".json")[1]
 
 CH, COLS, WIDTH = 64, 16, 1024

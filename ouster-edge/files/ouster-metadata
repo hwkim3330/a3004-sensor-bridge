@@ -6,8 +6,8 @@
 #   eval "$(ouster-metadata 192.168.1.50)"
 #   -> OUSTER_CHANNELS=64 OUSTER_COLUMNS=16 OUSTER_SCAN_WIDTH=1024 ...
 #
-# Exits non-zero and prints nothing on failure; callers should fall back to
-# their configured defaults.
+# Exits non-zero and prints nothing on stdout if it cannot get a usable answer;
+# callers should fall back to their configured defaults.
 
 HOST="$1"
 [ -n "$HOST" ] || { echo "usage: ouster-metadata <sensor-ip>" >&2; exit 2; }
@@ -19,26 +19,34 @@ fetch() {
 	uclient-fetch -q -T 5 -O "$TMP" "http://$HOST$1" 2>/dev/null
 }
 
-# Firmware 2.x exposes the whole metadata blob; 1.x only the data format.
-if fetch /api/v1/sensor/metadata; then
-	BASE='$.data_format'
-elif fetch /api/v1/sensor/metadata/lidar_data_format; then
-	BASE='$'
-else
-	echo "cannot reach sensor at $HOST" >&2
-	exit 1
-fi
-
 get() {
 	jsonfilter -i "$TMP" -e "$BASE.$1" 2>/dev/null
 }
 
-CH="$(get pixels_per_column)"
+# A 200 response is not proof of a usable one - a proxy, a captive portal or the
+# wrong IP will happily answer with HTML. So each candidate endpoint is only
+# accepted once it actually yields a channel count, and otherwise we fall
+# through to the next one.
+try() {
+	fetch "$1" || return 1
+	BASE="$2"
+	CH="$(get pixels_per_column)"
+	[ -n "$CH" ]
+}
+
+# Firmware 2.x exposes the whole metadata blob; 1.x only the data format.
+if try /api/v1/sensor/metadata '$.data_format'; then
+	:
+elif try /api/v1/sensor/metadata/lidar_data_format '$'; then
+	:
+else
+	echo "no usable data format from $HOST" >&2
+	exit 1
+fi
+
 COL="$(get columns_per_packet)"
 WIDTH="$(get columns_per_frame)"
 PROFILE="$(get udp_profile_lidar)"
-
-[ -n "$CH" ] || { echo "unexpected metadata from $HOST" >&2; exit 1; }
 
 echo "OUSTER_CHANNELS=${CH}"
 echo "OUSTER_COLUMNS=${COL:-16}"

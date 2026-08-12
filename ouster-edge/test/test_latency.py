@@ -27,7 +27,7 @@ import time
 
 BIN = os.environ.get("OUSTER_EDGE_BIN", "./ouster-edge")
 CH, COLS, WIDTH, SECTORS = 64, 16, 1024, 360
-PORT, SSE_PORT = 17532, 17603
+PORT, SSE_PORT = 26532, 26603
 FAR, NEAR = 30000, 1500          # mm
 ZONE = "0:20:5.0"                # 0-20 deg, 5 m
 

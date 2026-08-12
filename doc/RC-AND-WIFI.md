@@ -19,7 +19,7 @@ what the transmitters, and the Deviation project's reverse engineering, use).
 
 So there are three real options.
 
-### Option A — take i-BUS off a receiver (recommended)
+### Option A — take i-BUS off a receiver (implemented)
 
 Pair a normal FlySky receiver (FS-iA6B and friends) to the transmitter and read
 its **i-BUS servo output**, which is plain asynchronous serial. This is the easy
@@ -35,9 +35,22 @@ bytes 2..29 14 x uint16 little-endian channel values, 1000..2000 (microseconds)
 bytes 30,31 uint16      checksum = 0xFFFF - (sum of bytes 0..29)
 ```
 
-32 bytes at 115200 8N1, repeated about every 7.5 ms. Decoding it is a few dozen
-lines. (Format taken from documentation, not measured here — validate the
-checksum on real data before trusting it.)
+32 bytes at 115200 8N1, repeated about every 7.5 ms.
+
+This is what `rc-ibus` does. It verifies the checksum on every frame — accepting
+unverified RC input is worse than accepting none — resynchronises byte by byte
+after garbage, declares a link loss when frames stop, and publishes the channels
+to a status file and optionally to a UDP peer. The dashboard shows all 14
+channels as bars.
+
+The frame layout above comes from FlySky's documentation rather than from a
+receiver on this bench. It is verified against synthesised frames over a pty
+(`../rc-ibus/test/test_ibus.py`): exact channel decoding including extremes,
+rejection and counting of bad checksums, resync after garbage, link loss and
+recovery, the UDP forward, and a 100-frame burst at the real 7.5 ms cadence.
+What is *not* verified is that a real FS-iA6B emits exactly this — check the
+`bad_crc` counter is zero the first time you plug one in. If it climbs while
+`frames` stays at zero, the format assumption is wrong.
 
 The router has no exposed UART header other than the console, so this means a
 USB-serial adapter — and see `CAN.md` on the single USB port. A CP2102 or
@@ -46,7 +59,7 @@ CH340 is Full Speed and shares a USB 3.0 hub happily.
 SBUS is the other common output, but it is 100000 baud 8E2 **inverted**, which
 needs either an inverting buffer or a UART that can invert. i-BUS avoids that.
 
-### Option B — an A7105 module on SPI
+### Option B — an A7105 module on SPI (not implemented)
 
 This is the only way to talk AFHDS 2A over the air, including *transmitting*
 (acting as the remote rather than listening to one). It needs an A7105 breakout
@@ -59,7 +72,7 @@ If the goal is "the router acts as the remote control", note that this is the
 only option that does it over AFHDS 2A. Option A can only *listen* to a link
 that a real transmitter already owns.
 
-### Option C — skip RC entirely
+### Option C — skip RC entirely (already available)
 
 The router already has a WiFi AP and a dashboard. If what you want is a human
 steering something from a tablet, sending commands over WiFi to whatever holds
@@ -67,8 +80,8 @@ the control loop is simpler and has better telemetry than emulating a hobby RC
 protocol. The caveat from `CAN.md` applies: whoever holds the control loop needs
 a heartbeat and a stop-on-timeout, and that should not be behind a wireless hop.
 
-**Nothing in Option A or B is implemented in this tree.** It is written down
-because it is the sensible plan, not because it exists.
+Option B is not implemented. Option C needs no code beyond what the dashboard
+already is.
 
 ## How many things can the WiFi do at the same time?
 
@@ -117,6 +130,13 @@ wireless path than a wired one. If the lidar has to be lossless, wire it.
 Set it up with:
 
 ```sh
+# RC, if you have a receiver and a spare USB port
+uci set rc-ibus.ibus.enabled='1'
+uci set rc-ibus.ibus.device='/dev/ttyUSB0'
+uci commit rc-ibus && /etc/init.d/rc-ibus start
+logread -e rc-ibus
+
+# WiFi
 uci set wireless.radio1.disabled='0'
 uci set wireless.default_radio1.ssid='A3004-SENSOR'
 uci set wireless.default_radio1.encryption='psk2'

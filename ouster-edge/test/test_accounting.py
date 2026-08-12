@@ -7,6 +7,7 @@ import json, os, socket, struct, subprocess, sys, tempfile, time
 BIN=os.environ.get("OUSTER_EDGE_BIN", "./ouster-edge")
 STATUS=tempfile.mkstemp(suffix=".json")[1]
 CH,COLS,WIDTH=64,16,1024
+PORT=26512
 def px(r): return struct.pack("<IBBHHH", r, 200, 0, 0, 0, 0)
 def build(frame, mids):
     body=b""
@@ -16,7 +17,7 @@ def build(frame, mids):
 
 def run(skip_packets, pace, label):
     if os.path.exists(STATUS): os.remove(STATUS)
-    p=subprocess.Popen([BIN,"-f","-p","17512","-c",str(CH),"-C",str(COLS),
+    p=subprocess.Popen([BIN,"-f","-p",str(PORT),"-c",str(CH),"-C",str(COLS),
         "-w",str(WIDTH),"-s","1024","-S",STATUS,"-I","50"],stderr=subprocess.DEVNULL)
     time.sleep(0.6)
     tx=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
@@ -25,7 +26,7 @@ def run(skip_packets, pace, label):
     for frame in (7,8):
         for i,start in enumerate(range(0,WIDTH,COLS)):
             if frame==8 and i in skip_packets: continue
-            tx.sendto(build(frame,range(start,start+COLS)),("127.0.0.1",17512))
+            tx.sendto(build(frame,range(start,start+COLS)),("127.0.0.1",PORT))
             sent+=1
             time.sleep(pace)
     time.sleep(1.2)

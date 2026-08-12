@@ -27,6 +27,7 @@ define Package/a3004-sensorkit
 	+ouster-edge \
 	+mic-stream \
 	+can-bridge \
+	+rc-ibus \
 	+uhttpd
 endef
 
@@ -49,6 +50,7 @@ define Package/a3004-sensorkit/install
 	# the daemons write their status to tmpfs; expose them under the docroot
 	$(LN) /var/run/ouster-edge.json $(1)/www/sensors/ouster.json
 	$(LN) /var/run/can-bridge.json $(1)/www/sensors/can.json
+	$(LN) /var/run/rc-ibus.json $(1)/www/sensors/rc.json
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/sensor-probe $(1)/usr/sbin/sensor-probe
