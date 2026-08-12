@@ -19,6 +19,7 @@ is fixed here — see `doc/DBDC.md`.
 | [`doc/DBDC.md`](doc/DBDC.md) | why the upstream port was never merged, and the fix |
 | [`doc/CAN.md`](doc/CAN.md) | USB-CAN wiring, bus termination, and why injection is off by default |
 | [`doc/RC-AND-WIFI.md`](doc/RC-AND-WIFI.md) | why no WiFi chip can receive FlySky AFHDS 2A, what to do instead, and how many radios and SSIDs the DBDC fix buys |
+| [`doc/AFHDS2A.md`](doc/AFHDS2A.md) | the protocol analysed, and how the router *can* be the transmitter — with an A7105, not with its WiFi |
 | [`doc/TELEOP.md`](doc/TELEOP.md) | why a tablet cannot emulate a 2.4 GHz transmitter, and how it drives things over IP instead — with two independent deadmen |
 | [`doc/RING-FORMAT.md`](doc/RING-FORMAT.md) | the lidar range-ring wire format and JSON status |
 | [`doc/UPSTREAM.md`](doc/UPSTREAM.md) | the two pull requests this work becomes, in which order, and what to check before opening either |
@@ -33,6 +34,7 @@ is fixed here — see `doc/DBDC.md`.
 | `can-bridge` | bridges a SocketCAN interface to UDP, read-only unless told otherwise |
 | `rc-ibus` | decodes a FlySky receiver's i-BUS channel output |
 | `teleop` | takes joystick intent from the dashboard and forwards it with a deadman |
+| `rc-tx` | AFHDS 2A frame building — the half that needs no radio (not an installable package) |
 
 `doc/pc-side/ring_to_laserscan.py` republishes the ring as
 `sensor_msgs/LaserScan` on a machine with ROS 2.
@@ -72,6 +74,10 @@ python3 test_ibus.py           # i-BUS over a pty
 cd ../../teleop/test
 cc -O2 -Wall -Wextra -o teleop ../src/teleop.c
 python3 test_teleop.py         # arming, deadman, replay rejection, shutdown
+
+cd ../../rc-tx/test
+cc -O2 -Wall -Wextra -o test_afhds2a test_afhds2a.c ../src/afhds2a.c
+./test_afhds2a                 # AFHDS 2A hop sets and frame layouts
 ```
 
 If you run these repeatedly, note that a daemon left behind by an aborted run
@@ -105,6 +111,8 @@ Still needs the hardware:
 - a real OS-64: throughput, and whether MT7621 accepts a 9000-byte MTU
 - a real USB-CAN adapter enumerating and `gs_usb` binding on mipsel
 - a real FlySky receiver emitting the frame layout the decoder assumes
+- anything involving an A7105: there is no such chip on the bench, so the whole
+  radio half of doc/AFHDS2A.md is analysis plus untested code
 - anything actually being driven by teleop; the deadmen bound how long a runaway
   lasts, not whether one can happen
 - the antenna split the EEPROM reports (2×2+2×2 expected, unread)
