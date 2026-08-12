@@ -91,6 +91,20 @@ If you run them by hand repeatedly, note that a daemon left behind by an aborted
 run holds the port and quietly absorbs the traffic, which looks exactly like a
 parser regression. `pgrep -x ouster-edge` before blaming the code.
 
+## Emulator
+
+`emu/run-emu.py` boots the whole thing under QEMU on `malta/le`, which is the
+same `mipsel_24kc` triple as `ramips/mt7621` — the same package binaries, real
+procd, real uci, real uhttpd. It checks that uci-defaults applied, that the
+services are up once procd settles, that the dashboard serves, that synthetic
+lidar packets injected from the host complete revolutions, and that an SSE event
+is pushed while they flow.
+
+It cannot say anything about the device tree, mt76 or DBDC — QEMU has no
+MT7615D, and whether two phys appear is still a question only the board answers.
+What it does is take the userspace failures out of the bench session. See
+[`emu/README.md`](emu/README.md), including the two real defects it found.
+
 ## What is verified, and what needs the board
 
 Measured or exercised here:
@@ -113,6 +127,9 @@ Measured or exercised here:
 - `ring_to_laserscan.py` under ROS 2 jazzy
 - the dashboard on a Galaxy Tab S7 FE with camera, microphone, lidar, CAN and
   RC all live at once
+- a full first boot under QEMU on the same architecture: uci-defaults applied,
+  services up, dashboard serving, synthetic lidar packets completing revolutions
+  and pushing SSE events. Five consecutive boots, deterministic.
 
 Still needs the hardware:
 

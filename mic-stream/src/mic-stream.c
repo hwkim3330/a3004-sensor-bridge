@@ -33,10 +33,12 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_CLIENTS	8
 #define CHUNK		4096
+#define RETRY_S		5
 
 enum kind { K_NONE = 0, K_PCM, K_WAV };
 
@@ -56,7 +58,9 @@ static struct {
 	struct client cl[MAX_CLIENTS];
 	int ncl;
 	pid_t child;
-	uint64_t bytes, chunks;
+	uint64_t bytes, chunks, retries;
+	bool warned_missing;
+	bool ever_read;
 } g;
 
 static volatile sig_atomic_t stop_requested;
@@ -82,6 +86,14 @@ static void logmsg(int prio, const char *fmt, ...)
 		vsyslog(prio, fmt, ap);
 	}
 	va_end(ap);
+}
+
+static uint64_t now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
 /*
@@ -314,6 +326,7 @@ int main(int argc, char **argv)
 	struct sigaction sa;
 	uint8_t buf[CHUNK];
 	int lfd, pipefd, on = 1, opt, i;
+	uint64_t next_try = 0;
 
 	g.device = (char *)"hw:0,0";
 	g.rate = 16000;
@@ -371,8 +384,10 @@ int main(int argc, char **argv)
 
 	pipefd = spawn_arecord();
 	if (pipefd < 0) {
-		logmsg(LOG_ERR, "cannot start arecord: %s", strerror(errno));
-		return 1;
+		logmsg(LOG_WARNING,
+		       "cannot start arecord yet (%s); retrying every %d s",
+		       strerror(errno), RETRY_S);
+		next_try = now_ms() + RETRY_S * 1000;
 	}
 
 	logmsg(LOG_NOTICE, "%s %d Hz %d ch, period %d (%d ms), serving :%d",
@@ -382,9 +397,11 @@ int main(int argc, char **argv)
 	while (!stop_requested) {
 		int np = 0, n;
 
-		pfd[np].fd = pipefd;
-		pfd[np].events = POLLIN;
-		pfd[np++].revents = 0;
+		if (pipefd >= 0) {
+			pfd[np].fd = pipefd;
+			pfd[np].events = POLLIN;
+			pfd[np++].revents = 0;
+		}
 		pfd[np].fd = lfd;
 		pfd[np].events = POLLIN;
 		pfd[np++].revents = 0;
@@ -405,35 +422,74 @@ int main(int argc, char **argv)
 			int status = 0;
 
 			if (waitpid(g.child, &status, WNOHANG) == g.child) {
-				logmsg(LOG_ERR,
-				       "arecord exited (status %d); is %s the right device?",
-				       WIFEXITED(status) ? WEXITSTATUS(status) : -1,
-				       g.device);
-				break;
+				/* Exiting here put procd into a crash loop whenever
+				 * the device was absent - which on the router is
+				 * simply "the camera is not plugged in yet". Retry
+				 * with a backoff instead, and say so once rather
+				 * than filling the log. */
+				g.child = -1;
+				g.retries++;
+				/* Once per outage, not once per attempt: at a 5 s
+				 * retry this would otherwise be a slow log flood. */
+				if (!g.warned_missing) {
+					g.warned_missing = true;
+					logmsg(LOG_ERR,
+					       "arecord exited (status %d) on %s; retrying every %d s",
+					       WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+					       g.device, RETRY_S);
+				}
+				close(pipefd);
+				pipefd = -1;
+				next_try = now_ms() + RETRY_S * 1000;
 			}
 			child_died = 0;
 		}
 
-		if (pfd[1].revents & POLLIN)
+		if (pipefd < 0 && now_ms() >= next_try) {
+			pipefd = spawn_arecord();
+			if (pipefd < 0)
+				next_try = now_ms() + RETRY_S * 1000;
+			/* Deliberately no "device is back" here: fork succeeding
+			 * proves nothing about the device. That is only known once
+			 * samples actually arrive, below. */
+		}
+
+		if (pfd[pipefd >= 0 ? 1 : 0].revents & POLLIN)
 			client_accept(lfd);
 
-		for (i = g.ncl - 1; i >= 0; i--)
-			if (2 + i < np &&
-			    (pfd[2 + i].revents & (POLLERR | POLLHUP | POLLNVAL)))
-				client_drop(i);
+		{
+			int base = (pipefd >= 0 ? 2 : 1);
 
-		if (!(pfd[0].revents & (POLLIN | POLLHUP)))
+			for (i = g.ncl - 1; i >= 0; i--)
+				if (base + i < np &&
+				    (pfd[base + i].revents &
+				     (POLLERR | POLLHUP | POLLNVAL)))
+					client_drop(i);
+		}
+
+		if (pipefd < 0 || !(pfd[0].revents & (POLLIN | POLLHUP)))
 			continue;
 
 		n = (int)read(pipefd, buf, sizeof(buf));
 		if (n > 0) {
+			if (g.warned_missing) {
+				g.warned_missing = false;
+				logmsg(LOG_NOTICE,
+				       "capture device delivering again after %llu retries",
+				       (unsigned long long)g.retries);
+				g.retries = 0;
+			}
+			g.ever_read = true;
 			g.bytes += (uint64_t)n;
 			g.chunks++;
 			if (g.ncl)
 				fanout(buf, (size_t)n);
 		} else if (n == 0) {
-			logmsg(LOG_ERR, "arecord closed the pipe");
-			break;
+			/* Same reasoning as the child exiting: back off and try
+			 * again rather than handing procd a reason to loop. */
+			close(pipefd);
+			pipefd = -1;
+			next_try = now_ms() + RETRY_S * 1000;
 		} else if (errno != EAGAIN && errno != EWOULDBLOCK &&
 			   errno != EINTR) {
 			logmsg(LOG_ERR, "read: %s", strerror(errno));
@@ -450,7 +506,8 @@ int main(int argc, char **argv)
 		kill(g.child, SIGTERM);
 		waitpid(g.child, NULL, 0);
 	}
-	close(pipefd);
+	if (pipefd >= 0)
+		close(pipefd);
 	close(lfd);
 	return 0;
 }

@@ -48,12 +48,21 @@ start_service() {
 	# Prefer what the sensor reports over what is configured here - the
 	# lidar mode can be changed on the sensor without anyone updating UCI.
 	if [ -n "$sensor_ip" ]; then
-		if eval "$(/usr/sbin/ouster-metadata "$sensor_ip" 2>/dev/null)"; then
+		# Capture first and test the *command's* status. eval returns the
+		# status of the string it evaluated, so `eval "$(cmd)"` with a
+		# failing cmd evaluates "" and succeeds - which logged "sensor
+		# reports ..." with the fallback values while no sensor was
+		# reachable at all. That is a lie at exactly the moment someone
+		# is trying to find out whether the sensor is talking.
+		local meta
+		if meta="$(/usr/sbin/ouster-metadata "$sensor_ip" 2>/dev/null)" &&
+		   [ -n "$meta" ]; then
+			eval "$meta"
 			channels="${OUSTER_CHANNELS:-$channels}"
 			columns="${OUSTER_COLUMNS:-$columns}"
 			scan_width="${OUSTER_SCAN_WIDTH:-$scan_width}"
 			logger -t ouster-edge \
-			  "sensor $sensor_ip reports ${channels}ch x ${columns}col, width ${scan_width}, profile ${OUSTER_PROFILE}"
+			  "sensor $sensor_ip reports ${channels}ch x ${columns}col, width ${scan_width}, profile ${OUSTER_PROFILE:-unknown}"
 		else
 			logger -t ouster-edge \
 			  "sensor $sensor_ip unreachable, using configured layout ${channels}ch x ${columns}col"
@@ -79,7 +88,9 @@ start_service() {
 
 	config_foreach append_zone zone
 
-	procd_set_param respawn
+	# Paced rather than unlimited-and-instant: a device that is not
+	# plugged in yet must not become a hot restart loop.
+	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance

@@ -26,7 +26,9 @@ start_service() {
 		--channels "$channels" \
 		--period "$period" \
 		--port "$port"
-	procd_set_param respawn
+	# Paced rather than unlimited-and-instant: a device that is not
+	# plugged in yet must not become a hot restart loop.
+	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance
