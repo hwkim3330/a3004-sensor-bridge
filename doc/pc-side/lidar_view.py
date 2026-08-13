@@ -101,7 +101,10 @@ def main() -> int:
     s.settimeout(2.0)
 
     xs, ys, zs = [], [], []
-    last_img = np.full((nch, ncol * 8), np.nan)
+    # One column per measurement id, not per packet slot. Sizing this by
+    # columns_per_packet and folding mid into it aliased four azimuths onto each
+    # column, which read as gaps in the image.
+    last_img = np.full((nch, width), np.nan)
     got = bad = ncols = nret = 0
     end = time.time() + args.seconds
     while time.time() < end:
@@ -135,8 +138,8 @@ def main() -> int:
             xs.append(r[hit] * np.cos(theta[hit]) * np.cos(alt[hit]))
             ys.append(-r[hit] * np.sin(theta[hit]) * np.cos(alt[hit]))
             zs.append(r[hit] * np.sin(alt[hit]))
-            col = int(mid) % last_img.shape[1]
-            last_img[:, col] = np.where(hit, rng_m, np.nan)
+            if 0 <= mid < width:
+                last_img[:, mid] = np.where(hit, rng_m, np.nan)
     s.close()
 
     if not xs:
@@ -178,7 +181,7 @@ def main() -> int:
 
     b.set_facecolor("#0d0f13")
     b.imshow(last_img, aspect="auto", cmap="magma", interpolation="nearest")
-    b.set_title("range image (rows = channels, columns = azimuth)",
+    b.set_title(f"range image, {width} azimuths x {nch} channels",
                 color="#e6ecf5", fontsize=10)
     b.tick_params(colors="#8695ab", labelsize=8)
     for sp in b.spines.values():
