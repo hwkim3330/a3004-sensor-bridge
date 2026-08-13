@@ -681,6 +681,17 @@ static void packet_process(const uint8_t *pkt, size_t len, int txsock)
 
 			while (w <= mid && w < 4096)
 				w <<= 1;
+			if (w == g.scan_width) {
+				/* mid is past the widest mode this sensor family
+				 * has, so the column is bogus rather than
+				 * informative. Without this the log line below
+				 * fired for every such column - mid is 16 bits
+				 * of unvalidated network input, so one bad
+				 * stream meant thousands of "4096 -> 4096" lines
+				 * a second. */
+				g.st.invalid_cols++;
+				continue;
+			}
 			logmsg(LOG_INFO, "scan width %d -> %d", g.scan_width, w);
 			g.scan_width = w;
 		}

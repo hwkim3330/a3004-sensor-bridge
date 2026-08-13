@@ -51,4 +51,29 @@ sent, st = run({10,30,50}, 0.005, "  three gaps")
 ok3 = (st['packets']==sent and st['missed_columns']==48)
 print(f"  -> {'PASS' if ok3 else 'FAIL'} (expected missed_columns=48)")
 
-sys.exit(0 if (ok1 and ok2 and ok3) else 1)
+print("Q4: a column id past every real scan width -> counted, not logged forever")
+# measurement_id is 16 bits of unvalidated network input. The width-learning
+# path used to log and reassign on every such column, so one bad stream wrote
+# thousands of 'scan width 4096 -> 4096' lines a second into the ring buffer.
+# The first column still legitimately widens 1024 -> 4096 and logs once; the
+# remaining 15 are then recognised as bogus and counted.
+if os.path.exists(STATUS): os.remove(STATUS)
+err = tempfile.mkstemp(suffix=".log")[1]
+with open(err, "w") as ef:
+    p = subprocess.Popen([BIN,"-f","-p",str(PORT),"-c",str(CH),"-C",str(COLS),
+        "-w",str(WIDTH),"-s","1024","-S",STATUS,"-I","50"], stderr=ef)
+    time.sleep(0.6)
+    tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tx.sendto(build(9, [65535]*COLS), ("127.0.0.1", PORT))
+    time.sleep(0.8)
+    p.terminate(); p.wait(timeout=3)
+st = json.load(open(STATUS))
+widthlines = sum(1 for l in open(err) if "scan width" in l)
+print(f"  bogus mids: invalid={st['invalid_columns']} "
+      f"'scan width' log lines={widthlines}")
+ok4 = (st['invalid_columns'] == COLS - 1 and widthlines <= 1)
+print(f"  -> {'PASS' if ok4 else 'FAIL'} "
+      f"(expected invalid={COLS-1}, at most 1 log line)")
+os.remove(err)
+
+sys.exit(0 if (ok1 and ok2 and ok3 and ok4) else 1)
