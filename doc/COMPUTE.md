@@ -156,25 +156,56 @@ this stops being an inference.
 
 Same method as the Xavier estimate: measure here, scale by clock and IPC, and
 label it a prediction. `ouster-edge` built native and fed the live sensor at
-`2048x10` — 1280 datagrams/s, zero missed columns — cost **24.5 and 25.6 µs of
-CPU per datagram at `-O2`**, and 31.6 and 33.9 at `-Os`, over two rounds each.
+`2048x10` — 1280 datagrams/s, zero missed columns — cost **31.6 and 33.9 µs of
+CPU per datagram**, over two rounds.
 
 A 1004Kc at 880 MHz against this Skylake core is a 5.6x clock deficit and
-roughly 0.35–0.4 of its work per clock, so call it **15x**:
-
-| build | per datagram | at 1280/s |
-|---|---|---|
-| `-O2` | ~375 µs | **~48% of one CPU** |
-| `-Os` | ~480 µs | ~61% of one CPU |
-
-Which is why the flag is worth the twenty-four bytes: it buys about thirteen
-points of a CPU that also has to run the ethernet RX softirq for 126 Mbit/s,
-because that softirq has nowhere else to go.
+roughly 0.35–0.4 of its work per clock, so call it **15x**: about 480 µs per
+datagram, and at 1280 datagrams/s **roughly 60% of one CPU** — the same CPU that
+also has to run the ethernet RX softirq for 126 Mbit/s, because that softirq has
+nowhere else to go.
 
 So full rate through the router is plausible and not comfortable, and the ring
 it produces is 88 kbit/s either way. Measuring it for real needs the board
 powered, concurrently with the camera, and needs checking that `SO_RCVBUF` of
 4 MB survives `rmem_max`.
+
+### `-O2` was tried and refuted
+
+Worth recording, because the x86 evidence for it was good and will tempt
+somebody again.
+
+On this desktop, `-O2` cost 24.5 and 25.6 µs per datagram against `-Os`'s 31.6
+and 33.9 — reproducibly, alternating, about 23% cheaper. The mechanism was in
+gcc's own `-fopt-info-inline` output: at `-O2` and not at `-Os`, `px_range_mm`
+and `px_refl` are inlined into `packet_process`, which is **1024 calls per
+datagram** it stops making, plus `zones_column`, `in_az_window` and `rd64` per
+column.
+
+On mipsel it does not happen. `emu/oe-flagbench.py` runs both builds under the
+emulator with the injector inside the guest, and takes cost by subtraction
+between two datagram counts:
+
+| | user | sys | total |
+|---|---|---|---|
+| `-Os`, 36000 datagrams | 97 jiffies | 38 | **135** |
+| `-O2`, 36000 datagrams | 116 jiffies | 26 | **142** |
+
+An earlier round at 8000 datagrams had the two identical at 30 jiffies each. So
+`-O2` buys nothing and may cost a little, while making the binary 988 bytes
+larger — the wrong direction for a 32 kB instruction cache. The flag was
+removed.
+
+Two caveats on that measurement, so it is not over-read. QEMU's TCG has no cache
+or pipeline model, so it shows how much *work* the instruction stream does and
+not what an MT7621 would take in cycles. And the user/sys split is sampled per
+tick, so it is noisy — the totals are the trustworthy figure, which is why the
+totals are what the conclusion rests on.
+
+The transferable lesson is the one in the table above: a per-datagram cost
+measured on a wide out-of-order core says nothing reliable about a 1004Kc, in
+either direction. The 60%-of-a-CPU estimate above inherits that same weakness
+and stays labelled a prediction until the board is powered.
 
 ## The thing to do before either
 

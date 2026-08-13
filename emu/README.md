@@ -90,6 +90,33 @@ Do not let this stand in for the board:
   no sound card either, which is why `mic-stream` logs a missing device on every
   run — expected, and the reason it now retries instead of exiting.
 
+## Comparing two builds: `oe-flagbench.py`
+
+There is one thing the emulator answers that the host cannot: whether a compiler
+flag helps *on this architecture*.
+
+```sh
+CC=staging_dir/toolchain-mipsel_24kc_gcc-*/bin/mipsel-openwrt-linux-musl-gcc
+F="-pipe -mno-branch-likely -mips32r2 -mtune=24kc"
+mkdir -p /tmp/bench
+$CC -Os $F -o /tmp/bench/mips-Os package/keti/ouster-edge/src/ouster-edge.c
+$CC -O2 $F -o /tmp/bench/mips-O2 package/keti/ouster-edge/src/ouster-edge.c
+$CC -Os $F -o /tmp/bench/oe-inject package/keti/emu/oe-inject.c
+python3 oe-flagbench.py --bindir /tmp/bench
+```
+
+It boots the guest, pulls the binaries in over HTTP from this host
+(`192.168.1.2`, which is what QEMU's user-mode network calls it), runs each
+build against a fixed number of datagrams from `oe-inject` **inside the guest**,
+and reports CPU by subtraction between two counts so that startup and config
+parsing fall out.
+
+Read the caveats in `doc/COMPUTE.md` before trusting a number from it. TCG has no
+cache or pipeline model, and the user/sys split is tick-sampled and noisy — the
+totals are the part worth comparing. What it is good for is refuting a claim, and
+it has already done that once: an `-O2` override for `ouster-edge`, which was 23%
+cheaper per datagram on x86, turned out to be worth nothing on mipsel.
+
 ## Two things that look like bugs and are not
 
 **`rx` stays 0 in the CAN check.** A raw CAN socket does not receive its own
