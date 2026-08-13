@@ -93,7 +93,8 @@ if [ -n "$V" ]; then
 fi
 say ""
 say "MT_EE_NIC_CONF_0 (0x34) sets the chainmask, which decides whether the"
-say "DBDC split is 2x2+2x2 or 1x1+1x1. Expected 2x2+2x2, never read:"
+say "DBDC split is 2x2+2x2 or 1x1+1x1. One unit has been read: 0x44, giving"
+say "phy0 TX/RX 0x3 and phy1 0xc, i.e. 2x2 + 2x2. Compare:"
 say "  byte at 0x34: 0x$(hexdump -e '1/1 "%02x"' -s 52 -n 1 /dev/mtd2 2>/dev/null)"
 say ""
 say "first 64 bytes of the factory partition:"

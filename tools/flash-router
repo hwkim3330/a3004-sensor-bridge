@@ -1,0 +1,146 @@
+#!/bin/sh
+# Build, verify and flash this tree onto the router. One command.
+#
+# There is no automatic update to lean on. OpenWrt has no self-updater, and the
+# one supported remote path - attendedsysupgrade, via auc or owut - asks
+# OpenWrt's build server to produce an image for your device and package set.
+# That server only knows devices that are in the official tree, and the
+# A3004NS-M is not there yet; that is what the two pull requests are for. Until
+# they land, an update means building here and pushing it over, which is what
+# this does.
+#
+# The order of operations is the part worth keeping. Each step exists because
+# something went wrong without it:
+#
+#   - Check the uImage name before doing anything. The stock updater accepts an
+#     image on four tests and this is the one that says "right model"; a wrong
+#     name is a refusal at best.
+#   - Compare hashes with the running device and stop if they match. Reflashing
+#     an identical image costs a reboot and proves nothing.
+#   - Verify the hash again after copying, before flashing. A truncated upload
+#     that gets written is the one failure here with no easy way back.
+#   - Wait for it to come back and say what it found, rather than exiting on the
+#     sysupgrade call. sysupgrade kills ubus on its way out, so its own exit
+#     status tells you nothing.
+#
+# Usage: flash-router [host] [--keep|--reset] [--build-only]
+#   host       default 192.168.1.1
+#   --keep     preserve /etc/config (default)
+#   --reset    flash with -n, wiping configuration
+#   --build-only  build and verify, do not touch the device
+
+set -u
+
+HOST=192.168.1.1
+KEEP=1
+BUILD_ONLY=0
+PROFILE=iptime_a3004ns-m
+IMGDIR=bin/targets/ramips/mt7621
+IMG=openwrt-ramips-mt7621-${PROFILE}-squashfs-sysupgrade.bin
+UIMAGE_NAME=a3004nm
+
+for a in "$@"; do
+	case "$a" in
+	--keep) KEEP=1 ;;
+	--reset) KEEP=0 ;;
+	--build-only) BUILD_ONLY=1 ;;
+	-*) echo "unknown option $a" >&2; exit 2 ;;
+	*) HOST="$a" ;;
+	esac
+done
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Run from the tree root whichever directory this was invoked from.
+cd "$(dirname "$0")/../../.." || die "cannot find the tree root"
+[ -f rules.mk ] || die "this does not look like an OpenWrt tree"
+
+SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+     -o ConnectTimeout=8 -o PreferredAuthentications=password \
+     -o NumberOfPasswordPrompts=1 -o PubkeyAuthentication=no"
+
+say "== building"
+make -j"$(nproc)" || die "build failed"
+[ -f "$IMGDIR/$IMG" ] || die "no image at $IMGDIR/$IMG - is the profile selected?"
+
+say "== checking the image the stock updater would test"
+python3 - "$IMGDIR/$IMG" "$UIMAGE_NAME" <<'PY' || die "image failed its own checks"
+import struct, sys, zlib
+path, want = sys.argv[1], sys.argv[2]
+d = open(path, "rb").read()
+if struct.unpack(">I", d[0:4])[0] != 0x27051956:
+    print("  not a uImage"); sys.exit(1)
+name = d[32:64].split(b"\0")[0].decode("ascii", "replace")
+size = struct.unpack(">I", d[12:16])[0]
+hdr = bytearray(d[:64]); stored_h = struct.unpack(">I", d[4:8])[0]
+hdr[4:8] = b"\0\0\0\0"
+ok_h = zlib.crc32(bytes(hdr)) & 0xffffffff == stored_h
+ok_d = zlib.crc32(d[64:64 + size]) & 0xffffffff == struct.unpack(">I", d[24:28])[0]
+print(f"  name {name!r}  header CRC {'ok' if ok_h else 'BAD'}  data CRC {'ok' if ok_d else 'BAD'}")
+if name != want:
+    print(f"  name is not {want!r} - the stock updater would refuse this"); sys.exit(1)
+sys.exit(0 if (ok_h and ok_d) else 1)
+PY
+
+LOCAL=$(sha256sum "$IMGDIR/$IMG" | cut -d' ' -f1)
+SIZE=$(stat -c%s "$IMGDIR/$IMG")
+LIMIT=$((16128 * 1024))
+[ "$SIZE" -le "$LIMIT" ] || die "image is $SIZE bytes, over the $LIMIT firmware partition"
+say "  $SIZE bytes, $((SIZE * 100 / LIMIT))% of the firmware partition"
+say "  sha256 $LOCAL"
+
+[ "$BUILD_ONLY" = 1 ] && { say "== build-only, stopping here"; exit 0; }
+
+say "== $HOST"
+$SSH "root@$HOST" true 2>/dev/null || die "cannot reach $HOST over ssh"
+
+RUNNING=$($SSH "root@$HOST" 'cat /etc/openwrt_version 2>/dev/null; \
+	. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_REVISION"' 2>/dev/null | tail -1)
+say "  running $RUNNING"
+
+# If the device already has this exact image, there is nothing to do.
+ONDEV=$($SSH "root@$HOST" "sha256sum /tmp/$IMG 2>/dev/null | cut -d' ' -f1" 2>/dev/null)
+if [ "$ONDEV" = "$LOCAL" ]; then
+	say "  the same image is already staged in /tmp"
+fi
+
+say "== copying"
+scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1 \
+    -o PubkeyAuthentication=no "$IMGDIR/$IMG" "root@$HOST:/tmp/" \
+    >/dev/null 2>&1 || die "copy failed"
+
+REMOTE=$($SSH "root@$HOST" "sha256sum /tmp/$IMG | cut -d' ' -f1" 2>/dev/null)
+[ "$REMOTE" = "$LOCAL" ] || die "hash mismatch after copy: $REMOTE
+this is the one failure worth stopping for - do not flash a truncated image"
+say "  hash verified on the device"
+
+if [ "$KEEP" = 1 ]; then
+	FLAGS=""
+	say "== flashing, keeping /etc/config"
+else
+	FLAGS="-n"
+	say "== flashing, WIPING configuration"
+fi
+
+# sysupgrade takes ubus down with it, so its exit status here means nothing.
+$SSH "root@$HOST" "sysupgrade $FLAGS /tmp/$IMG" 2>&1 | sed 's/^/  /'
+
+say "== waiting for it to come back"
+i=0
+while [ "$i" -lt 90 ]; do
+	sleep 5
+	i=$((i + 1))
+	if $SSH "root@$HOST" true 2>/dev/null; then
+		NEW=$($SSH "root@$HOST" '. /etc/openwrt_release; echo "$DISTRIB_REVISION"' 2>/dev/null)
+		say "  back after $((i * 5))s, now $NEW"
+		say "== what came up"
+		$SSH "root@$HOST" 'echo "  phys: $(ls /sys/class/ieee80211/ | tr "\n" " ")"; \
+			echo "  overlay: $(df -h /overlay 2>/dev/null | tail -1)"; \
+			echo "  video: $(ls /dev/video* 2>/dev/null | tr "\n" " ")"' 2>/dev/null
+		exit 0
+	fi
+done
+die "it did not come back within $((i * 5))s - use the serial console on J4 at 57600
+before reflashing anything"
