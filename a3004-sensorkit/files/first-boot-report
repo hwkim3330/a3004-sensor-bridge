@@ -31,7 +31,13 @@ hdr "cpus, and whether anything spreads across them"
 # CPUs while there are only two sets of execution units. The second thread on a
 # core is worth well under a second core, which matters when reading load.
 NCPU=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
-say "logical cpus: ${NCPU:-?}   (MT7621 = 2 cores x 2 threads, so 4 is correct)"
+case "$NCPU" in
+4)  NOTE="expected: 2 cores x 2 hardware threads" ;;
+2)  NOTE="ONLY 2 - the second thread per core is not being used" ;;
+1)  NOTE="ONLY 1 - either SMP is off or this is not an MT7621" ;;
+*)  NOTE="unexpected; MT7621 should report 4" ;;
+esac
+say "logical cpus: ${NCPU:-?}   ($NOTE)"
 say "cpu model:    $(sed -n 's/^\(cpu model\|model name\)[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo | head -1)"
 say ""
 # The interesting part is not the count but the distribution. Ethernet has one
