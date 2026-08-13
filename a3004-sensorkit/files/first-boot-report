@@ -26,6 +26,35 @@ say "release:  $(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_RELEASE $DIS
 say "kernel:   $(uname -r)"
 say "uptime:   $(cut -d' ' -f1 /proc/uptime)s"
 
+hdr "cpus, and whether anything spreads across them"
+# MT7621 is two 1004Kc cores with two hardware threads each, so Linux sees four
+# CPUs while there are only two sets of execution units. The second thread on a
+# core is worth well under a second core, which matters when reading load.
+NCPU=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+say "logical cpus: ${NCPU:-?}   (MT7621 = 2 cores x 2 threads, so 4 is correct)"
+say "cpu model:    $(sed -n 's/^\(cpu model\|model name\)[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo | head -1)"
+say ""
+# The interesting part is not the count but the distribution. Ethernet has one
+# RX NAPI instance for the whole block - the other three RX rings are hardware
+# LRO, not receive-side scaling - so all ethernet RX softirq work lands on
+# whichever CPU takes fe2. TX is a separate interrupt and can land elsewhere.
+say "interrupts per cpu (which cpu is actually doing the work):"
+head -1 /proc/interrupts | sed 's/^/    /'
+grep -iE 'fe1|fe2|mtk|eth|mt76|wifi|xhci|usb' /proc/interrupts 2>/dev/null | sed 's/^/    /'
+say ""
+say "packet steering (RPS) moves post-NAPI work off the interrupt cpu:"
+PS=$(uci -q get network.@globals[0].packet_steering 2>/dev/null)
+say "  network.globals.packet_steering = ${PS:-<unset, so off>}"
+for q in /sys/class/net/br-lan/queues/rx-*/rps_cpus \
+         /sys/class/net/lan1/queues/rx-*/rps_cpus; do
+	[ -e "$q" ] || continue
+	say "  $q = $(cat "$q" 2>/dev/null)"
+done
+say ""
+say "If a sensor stream is dropping and one cpu sits at 100% while the others"
+say "idle, this section is where that shows, and packet_steering=1 is the first"
+say "thing to try. It is off by default and has not been measured on this board."
+
 hdr "QUESTION 1: did DBDC come up?"
 say "This is the whole reason the port was never merged. Two phys = fixed."
 say ""

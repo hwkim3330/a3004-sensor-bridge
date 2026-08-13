@@ -113,6 +113,45 @@ Check the Ethernet port count on whichever is chosen before committing. Full
 rate wants a port to itself; sharing one with the router uplink puts 126 Mbit/s
 of unpaced UDP next to everything else.
 
+## And the router's own cores
+
+Worth stating because "MT7621 is dual core" invites the wrong expectation.
+
+The kernel side is fully enabled and none of it needed changing — it is stock
+ramips: `CONFIG_SMP=y`, `CONFIG_MIPS_MT_SMP=y`, `CONFIG_MIPS_CPS=y`,
+`CONFIG_NR_CPUS=4`, `CONFIG_SCHED_SMT=y`. Linux sees four CPUs.
+
+Four is not four cores. MT7621 is **two 1004Kc cores with two hardware threads
+each**, and the second thread on a core shares that core's execution units. It
+helps when one thread is stalled on memory, which on a router it often is, but it
+is not a second core's worth of throughput.
+
+More importantly, **ethernet receive does not scale across them at all.**
+`mtk_eth_soc` registers a single RX NAPI instance for the whole block
+(`struct napi_struct rx_napi`, one `netif_napi_add`), and the other three entries
+in `rx_ring[MTK_MAX_RX_RING_NUM]` exist for hardware LRO, not for receive-side
+scaling. So every packet the switch hands up is processed on whichever CPU takes
+the `fe2` interrupt. TX is a separate interrupt (`fe1`) and can sit elsewhere,
+which is the only split the hardware gives for free.
+
+What does spread:
+
+- the four sensor daemons are separate single-threaded processes, so the
+  scheduler places them independently — which is the right shape for this SoC
+  whether or not it was designed for it
+- mt76 with DBDC has per-phy work, so two radios are not one radio's worth of
+  one CPU
+- RPS, via `network.globals.packet_steering`, moves protocol processing off the
+  interrupt CPU after NAPI. It is **off by default and has never been measured on
+  this board.** For a workload that terminates traffic locally — ustreamer
+  serving frames, ouster-edge taking 126 Mbit/s of UDP — this is the one knob
+  with a plausible effect, and the honest status is untested rather than
+  recommended.
+
+`first-boot-report` now prints the CPU count, the per-CPU interrupt counts for
+eth/mt76/xhci, and the current RPS masks, so the next time the board is powered
+this stops being an inference.
+
 ## The thing to do before either
 
 None of this is the binding constraint right now. **The vehicle does not move
