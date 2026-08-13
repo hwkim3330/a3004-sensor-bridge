@@ -1,17 +1,28 @@
 # Getting this upstream
 
-Two changes, two projects, in this order. The order is not optional: OpenWrt
-does not carry patches for mt76 in its tree — it pins a mt76 commit and bumps it
-— so the driver change has to land in mt76 first, and only then can the device
-support be submitted without a patch attached.
+Two changes, two projects. **They are parallel, not serialised** — an earlier
+version of this document claimed the driver change had to land in mt76 first,
+and that was wrong.
+
+OpenWrt does pin an mt76 commit rather than developing against it, but it also
+carries patches against that pin in `package/kernel/mt76/patches/` and drops
+them once the pin catches up. There are ~57 such patches in its history, and the
+removal commits say so outright — e40458a2ff, "mt76: remove obsolete patches /
+Already included in the last update", by nbd himself. Bumps are frequent:
+2026-03-01, 03-05, 03-19, 03-23, 06-24, 07-01.
+
+So the device support can be submitted with the driver change attached as a
+numbered patch, which is the ordinary holding pattern, and the patch disappears
+at whichever bump includes it. Waiting for mt76 to merge first is allowed but
+buys nothing.
 
 ## Branch map
 
 | branch | what it is | for |
 |---|---|---|
-| `hwkim3330/mt76` `mt7615-dbdc-dt` | 13 lines in `mt7615/eeprom.c` | **PR 1**, to `openwrt/mt76` |
-| `hwkim3330/openwrt` `upstream/ramips-a3004ns-m` | 3 files, 200 insertions | **PR 2**, to `openwrt/openwrt`, after PR 1 lands |
-| `hwkim3330/openwrt` `upstream/a3004ns-m` | both, with the driver change as a local patch | works today, not for submission |
+| `hwkim3330/mt76` `mt7615-dbdc-dt` | 14 lines in `mt7615/eeprom.c` | **PR 1**, to `openwrt/mt76` |
+| `hwkim3330/openwrt` `upstream/a3004ns-m` | device support + the driver change as a local patch | **PR 2**, to `openwrt/openwrt` — submit this one |
+| `hwkim3330/openwrt` `upstream/ramips-a3004ns-m` | device support alone, 3 files | PR 2 **only if** mt76 has already landed and been pinned |
 | `hwkim3330/openwrt` `iptime-a3004ns-m` | everything, including the KETI sensor bridge | day-to-day work |
 
 Both PR branches were checked against their upstream: each is **1 commit ahead,
@@ -51,10 +62,17 @@ commit is **authored by him** with his `Signed-off-by` intact — he wrote it, a
 the rebase does not change that. A second `Signed-off-by` and a bracketed note
 record what the rebase changed and why the port is now mergeable.
 
-Do not open this until PR 1 is merged and OpenWrt has bumped its mt76 pin.
+Submit the `upstream/a3004ns-m` variant, which is these three files **plus**
+`package/kernel/mt76/patches/100-mt7615-allow-forcing-DBDC-from-device-tree.patch`.
 Without the driver change the port still builds and still works on 2.4 GHz, but
-the 5 GHz phy will not appear, which is exactly the reason the original was
-closed — submitting it again in that state would be repeating the mistake.
+the 5 GHz phy will not appear — which is exactly the reason the original was
+closed, so submitting it in that state would repeat the mistake. Carrying the
+patch avoids that without waiting on anyone.
+
+Say in the PR description that the patch is a temporary carry, that PR 1 is open
+against `openwrt/mt76`, and that the patch should be dropped at the bump which
+includes it. The patch header says the same thing, so a maintainer who reads only
+the diff still sees it.
 
 ## About the sign-offs
 
