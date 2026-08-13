@@ -39,6 +39,28 @@ EOF
 make defconfig && make -j$(nproc)
 ```
 
+### If `a3004-sensorkit` will not stay selected
+
+`make defconfig` drops it silently and the build then produces an image with no
+dashboard and no uci-defaults, which looks like a code failure and is not one.
+Two causes, both worth knowing:
+
+- **Switching targets invalidates the package metadata.** The first `defconfig`
+  after changing `CONFIG_TARGET_*` regenerates `tmp/.packageinfo` and drops every
+  package selection it could not yet resolve. Run `defconfig`, then append the
+  package lines, then run it again.
+- **`kmod-video-core` is a hard dependency and is not implied.** The generated
+  entry in `tmp/.config-package.in` carries `depends on PACKAGE_kmod-video-core`
+  and `depends on USB_SUPPORT` alongside a pile of `select`s, and a `depends on`
+  is not satisfied by selecting the package that needs it. Set
+  `CONFIG_PACKAGE_kmod-video-core=y` explicitly.
+
+When a selection vanishes, read the entry rather than guessing:
+
+```sh
+awk '/config PACKAGE_a3004-sensorkit$/,/^$/' tmp/.config-package.in
+```
+
 ## Why malta/le
 
 `malta/le` is `mipsel` + `24kc` — the same architecture triple as

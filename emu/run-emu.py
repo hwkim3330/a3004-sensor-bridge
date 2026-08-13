@@ -530,6 +530,57 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
             print(f"  INFO  rx={snap.get('rx')} (a raw CAN socket does not see "
                   f"its own frames; receive is covered by the host tests)")
 
+            # Protocol generation detection, on mipsel.
+            #
+            # 0x211 above is not a generation marker, so the daemon must still
+            # say "unknown" - it must not default to the generation its own
+            # decoder implements.
+            check("protocol not guessed from 0x211",
+                  snap.get("agilex_protocol"), "unknown")
+
+            # Now make it hear a real v2 marker. It cannot be the running
+            # daemon's own injection: a raw CAN socket does not receive what it
+            # sent, which is the same property noted above. So start a second
+            # bridge, inject 0x241 through that one, and the service instance
+            # sees it as an ordinary frame from another sender.
+            # `& echo PID=$!` rather than a bare `&`: cmd() wraps what it is
+            # given as `echo BEGIN; LINE; echo END`, so a line ending in `&`
+            # becomes `& ;` and the shell rejects it.
+            out2 = emu.cmd("can-bridge -f -i vcan0 -l 7721 --allow-inject "
+                           "-S /tmp/cb2.json >/tmp/cb2.log 2>&1 & echo PID=$!")
+            pid2 = None
+            for tok in (out2 or "").replace("\n", " ").split():
+                if tok.startswith("PID=") and tok[4:].isdigit():
+                    pid2 = tok[4:]
+            time.sleep(1.5)
+            tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            marker = b"BCAN" + bytes([1, 1, 0, 0]) + \
+                struct.pack("<IB3x8s", 0x241, 8, bytes(8))
+            for _ in range(6):
+                tx.sendto(marker, ("127.0.0.1", FWD_UDP[7721]))
+                time.sleep(0.1)
+            tx.close()
+            time.sleep(2.0)
+
+            raw2 = emu.cmd("cat /var/run/can-bridge.json 2>/dev/null "
+                           "| tr -d ' \\n\\t'")
+            snap2 = {}
+            if raw2:
+                import json as _json2
+                try:
+                    snap2 = _json2.loads(raw2)
+                except Exception:
+                    snap2 = {}
+            check("0x241 detected as protocol v2 on mipsel",
+                  snap2.get("agilex_protocol"), "v2")
+            said = emu.cmd("logread | grep -i 'protocol v' | tail -1")
+            print(f"  INFO  the daemon logged: {said or '(nothing)'}")
+            # Only the second instance. Killing by name would take the service
+            # one with it and leave the rest of the run in a different state
+            # than it expects.
+            if pid2:
+                emu.cmd(f"kill {pid2} 2>/dev/null; echo ok")
+
         # --- i-BUS over an emulated USB-serial adapter ---
         if ibus:
             print("\n  rc-ibus over emulated USB-serial")
