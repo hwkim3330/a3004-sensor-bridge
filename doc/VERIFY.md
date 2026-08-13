@@ -42,6 +42,55 @@ Settled off-hardware, so do not spend bench time on it:
 | CAN inject works on mipsel | same run, with `kmod-can-vcan`: bridge starts on vcan0 and injects, nothing rejected |
 | The app speaks the daemon's protocol | `TeleopSender.send()` byte-for-byte against `handle_udp_cmd()`: magic, version, flags, LE sequence, axes at 12/14/16, length 24 |
 
+## Bench results — 2026-08-13, on hardware
+
+Flashed via the stock web UI, then sysupgraded to the persistent squashfs.
+`/dev/mtdblock6` is jffs2 on `/overlay`, and everything below survived a real
+power-cycle reboot.
+
+| # | Result |
+|---|---|
+| A1 | `0x3e` = **0x0a**, band_sel **0** (MT_EE_DUAL_BAND) — the same value mans0n dumped in 2021, now confirmed on this unit |
+| A3 | **two phys**: phy0 at 2412 MHz, phy1 at 5180 MHz. The driver says so itself: `phy1: copying sband (band 1)` |
+| A4 | both on the air **at once**, both Master: `A3004-24G` ch1 HT20 and `A3004-5G` ch36 **VHT80/11ac** |
+| A5 | no mt7615 or MCU errors. N9 and CR4 firmware load. The two `BAR 0 ... failed to assign` lines are the usual mt7621 PCIe host-bridge message |
+| A6 | `0x34` = **0x44** → phy0 TX/RX `0x3`, phy1 `0xc` = **2x2 + 2x2**, not 1x1+1x1. Matches the mechanism the mt76 commit describes: `chainmask & ~mphy.chainmask` = 0xf & ~0x3 = 0xc |
+| B1 | the stock updater accepted the image. It checks four things — uImage magic, the name field `a3004nm`, header CRC, data CRC — and ours satisfies all four |
+| B3 | lan1 links at **1000Mbps**; lan2-4 and wan correctly down with nothing plugged in |
+| B6 | USB 3.0 works: Logitech StreamCam at `Spd=5000` |
+| C1 | 720p MJPEG passthrough. **61 fps / 95 Mbit/s at q80**, loadavg 0.44 — ustreamer shows 0% CPU because the camera does the JPEG and the router only relays |
+
+MAC assignment, all four matching mans0n's table:
+
+| | measured | rule |
+|---|---|---|
+| LAN | `70:5d:cc:77:4c:03` | u-boot 0x1fc20 **+3** |
+| WAN | `70:5d:cc:77:4c:01` | u-boot 0x1fc40 |
+| phy1 5 GHz | `70:5d:cc:77:4c:00` | factory 0x4 |
+| phy0 2.4 GHz | `72:5d:cc:77:4c:03` | LAN with the local bit set |
+
+### Still open
+
+- **B4, the label MAC.** Not measured: the sticker is on the underside. What is
+  known is that the *stock* firmware used `...4C:00` for its LAN, which under
+  OpenWrt belongs to the 5 GHz phy while LAN is `...4C:03`. If the sticker reads
+  `...4C:00` then no netdev carries the label MAC and leaving `label-mac-device`
+  out of the device tree was right. That is an inference from the stock
+  behaviour, not a reading of the label.
+- **C2 lidar, C5b CAN-after-boot** — need the sensor and the adapter.
+- **A2**, the counterfactual (one phy without the patch), was not run. The patch
+  is what the original author said was missing, and forcing it produces two
+  working phys, so the causal claim rests on that rather than on a before shot.
+
+### One measurement that changes a design choice
+
+`--quality` does nothing in passthrough: dropping it 80 → 70 left the frame size
+at ~192 kB, essentially unchanged, and only the fps drop took effect (61 → 22.5,
+so 95 → 34.6 Mbit/s). 95 Mbit/s does not fit 2.4 GHz at all and is heavy for
+5 GHz, so a tablet on the AP should be served a lower **frame rate**; reducing
+per-frame size means re-encoding on the CPU or changing the camera's own
+controls.
+
 ## Gate A — before opening the mt76 PR
 
 | # | Claim the patch makes | Measurement | Result |
