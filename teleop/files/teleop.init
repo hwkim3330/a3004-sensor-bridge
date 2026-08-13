@@ -7,7 +7,7 @@ USE_PROCD=1
 PROG=/usr/sbin/teleop
 
 start_service() {
-	local enabled port remote rate timeout
+	local enabled port remote rate timeout cmd_port
 
 	config_load teleop
 	config_get_bool enabled control enabled 0

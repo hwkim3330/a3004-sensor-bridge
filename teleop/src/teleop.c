@@ -289,7 +289,15 @@ static void handle_cmd(const char *qs)
 	bool have_seq;
 
 	seq = qs_int(qs, "s", -1, &have_seq);
-	if (!have_seq) {
+	/*
+	 * A negative sequence has to be refused, not just cast. "s=-5" becomes
+	 * 4294967291 as a uint32, and every ordinary sequence after it then
+	 * looks like a backwards jump of more than 1000 - i.e. a client
+	 * restart - so seq_accept() would wave through everything, including
+	 * replays, for the rest of the process's life. The UDP path cannot hit
+	 * this because it reads four raw bytes.
+	 */
+	if (!have_seq || seq < 0) {
 		g.malformed++;
 		return;
 	}

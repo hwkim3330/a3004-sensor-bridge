@@ -167,6 +167,31 @@ def main():
         check("replayed axis ignored", s2["axes"][0], 0.42)
         check("still armed", s2["armed"], True)
 
+        # A negative sequence has to be refused rather than cast. "s=-5" is
+        # 4294967291 as a uint32, and once that is stored every ordinary
+        # sequence looks like a backwards jump of more than 1000 - a client
+        # restart - so replay protection would be gone for the rest of the
+        # process's life.
+        #
+        # Asserted on counters, not on axis values: the deadman is 300 ms, and
+        # the section above deliberately leaves the last accepted command
+        # already ~240 ms old, so an axis check here measures the deadman.
+        before = st()
+        cmd(arm=1, a0=9999, s=-5)
+        time.sleep(0.15)          # > the 100 ms status-file interval
+        s2b = st()
+        check("negative sequence counted malformed",
+              s2b["malformed"] >= before["malformed"] + 1, True)
+        check("negative sequence not counted as command",
+              s2b["commands"], before["commands"])
+
+        # The real property: replay protection is still intact afterwards.
+        rej = s2b["rejected_seq"]
+        cmd(arm=1, a0=8888, s=2)          # ancient again
+        time.sleep(0.15)
+        check("replay still rejected after a negative sequence",
+              st()["rejected_seq"] >= rej + 1, True)
+
         # ---- 5. the deadman ----
         print("\n--- deadman ---")
         cmd(arm=1, a0=6000)
