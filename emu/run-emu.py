@@ -460,13 +460,28 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
                      "ip link set up vcan0 2>/dev/null; "
                      "ip link show vcan0 >/dev/null 2>&1 && echo yes || echo no")
         have_vcan = bool(up and up.strip() == "yes")
-        check("vcan available in the guest", have_vcan, f"got {up!r}")
+        if have_vcan:
+            check("vcan available in the guest", True)
+        else:
+            # Not a failure: vcan is a test-only module and has no business in
+            # the router image, so an image built without kmod-can-vcan is a
+            # perfectly good image. Making this a hard check meant the harness
+            # reported "FAILED: 1 of 1 runs" for a missing test fixture -- and
+            # worse, the round trip below has therefore never actually run.
+            # Select kmod-can-vcan in the emulator's config to exercise it.
+            print("  SKIP  vcan not in this image; the CAN round trip is "
+                  "not exercised (select kmod-can-vcan to enable it)")
 
         if have_vcan:
             # There is no python or cansend in the guest, so the frame is put on
-            # the bus by the bridge itself: host -> UDP -> inject -> vcan0. vcan
-            # loops locally-sent frames back, so the bridge then *receives* what
-            # it injected and the round trip exercises both directions on mipsel.
+            # the bus by the bridge itself: host -> UDP -> inject -> vcan0.
+            #
+            # This is one direction only. An earlier version of this comment
+            # claimed vcan loops the frame back so receive was covered too; it
+            # is not, because a raw CAN socket does not get its own sent frames
+            # unless CAN_RAW_RECV_OWN_MSGS is set, and the bridge does not set
+            # it. That is why rx stays 0 below and why the receive path is
+            # covered by the host tests against a real vcan pair instead.
             emu.cmd("uci set can-bridge.bus.enabled=1")
             emu.cmd("uci set can-bridge.bus.interface=vcan0")
             emu.cmd("uci set can-bridge.bus.track=211,251")
@@ -595,8 +610,17 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
               f"tail: {out!r}")
 
         print("\n  logs")
-        errs = emu.cmd("logread | grep -icE 'error|fatal' || true")
-        print(f"  INFO  log lines matching error/fatal: {errs}")
+        # Print the lines, not just how many. A bare count is not actionable:
+        # it cannot distinguish "an expected complaint about an absent sensor"
+        # from "a daemon is broken", so nobody can act on it and it gets
+        # ignored - which is the same as not checking at all.
+        errs = emu.cmd("logread | grep -iE 'error|fatal' | tail -6 || true")
+        if errs and errs.strip():
+            print("  INFO  log lines matching error/fatal:")
+            for line in errs.strip().splitlines():
+                print(f"          {line.strip()}")
+        else:
+            print("  INFO  no log lines matching error/fatal")
         crash = emu.cmd("logread | grep -iE 'segfault|oom|kernel BUG' | head -3")
         check("no segfault/oom/BUG in the log", not (crash and crash.strip()),
               f"{crash!r}")

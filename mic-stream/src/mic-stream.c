@@ -126,6 +126,28 @@ static int spawn_arecord(void)
 		dup2(fds[1], STDOUT_FILENO);
 		close(fds[0]);
 		close(fds[1]);
+
+		/*
+		 * The "once per outage" guard on our own message does nothing
+		 * about arecord's, which procd forwards to syslog under this
+		 * service's name. With no capture device that is one
+		 * daemon.err line every retry, for ever - about 17k lines a
+		 * day on a router with nothing plugged in, burying whatever
+		 * someone is actually trying to read.
+		 *
+		 * So the first attempt of an outage keeps stderr, which puts
+		 * the real reason in the log exactly once, and the retries
+		 * after it are silenced. warned_missing is cleared when
+		 * samples arrive again, so the next outage speaks up too.
+		 */
+		if (g.warned_missing) {
+			int null = open("/dev/null", O_WRONLY);
+
+			if (null >= 0) {
+				dup2(null, STDERR_FILENO);
+				close(null);
+			}
+		}
 		execlp("arecord", "arecord",
 		       "-D", g.device,
 		       "-f", "S16_LE",
@@ -187,7 +209,12 @@ static void client_accept(int lfd)
 	enum kind kind;
 	int fd, on = 1, n;
 
-	fd = accept(lfd, NULL, NULL);
+	/* CLOEXEC because this process forks arecord: without it, every client
+	 * socket open at the moment arecord is (re)started is duplicated into
+	 * it, and a browser that disconnects leaves a socket that is not fully
+	 * torn down until arecord itself exits - which, since arecord is
+	 * restarted only on failure, can be hours. */
+	fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
 	if (fd < 0)
 		return;
 	if (g.ncl >= MAX_CLIENTS) {
@@ -364,7 +391,7 @@ int main(int argc, char **argv)
 	sigaction(SIGCHLD, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
-	lfd = socket(AF_INET, SOCK_STREAM, 0);
+	lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (lfd < 0) {
 		logmsg(LOG_ERR, "socket: %s", strerror(errno));
 		return 1;
