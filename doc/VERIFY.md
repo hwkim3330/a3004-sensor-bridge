@@ -26,6 +26,22 @@ So the mt76 patch is the fix the original author said he was waiting for. What i
 *not* yet verified is that this particular unit matches, and that the override
 actually produces two working phys rather than just setting a flag.
 
+## What the bench no longer has to establish
+
+Settled off-hardware, so do not spend bench time on it:
+
+| Thing | How |
+|---|---|
+| Both patches are submission-clean | `checkpatch.pl --strict`: 0 errors, 0 warnings on the mt76 commit. The remaining reports on the OpenWrt side are false positives, each confirmed against a merged commit — trailing whitespace fires on any commit that adds a `.patch` file (merged f95def2098 produces 7), MAINTAINERS does not exist in this tree, and >75-char commit lines are not OpenWrt's convention (18 of 40 merged `ramips: add support` commits exceed it) |
+| Author and signer agree | was `hwkim3330@gmail.com` vs a `hwkim3@keti.re.kr` sign-off; 58 of 60 merged commits match, so it mattered. Fixed |
+| The flashed DTB really carries both properties | decompiled from `image-mt7621_iptime_a3004ns-m.dtb`: `mediatek,dbdc` and `linux,default-trigger = "phy0radio"` |
+| Partition arithmetic | `IMAGE_SIZE` 16128k == firmware `0xfc0000`; partitions tile 0→16 MiB exactly; both MAC cells inside u-boot; EEPROM cell inside factory |
+| The pins the LEDs and buttons need are actually freed | mt7621 pinctrl `FUNC(name, mode, base, count)`: `i2c`→GPIO 3,4 (wps, reset), `jtag`→13–17 (LED 17), `wdt`→18 (LED 18) |
+| USB needs no device-tree work | `xhci` in mt7621.dtsi has no `status`, so it is enabled by default |
+| Services start and run on this architecture | `emu/run-emu.py --radios 2` passes end to end on malta/le, same `mipsel_24kc` as the target: uhttpd, ouster-edge, the dashboard, the SSE ring, the two-radio config path, `first-boot-report` |
+| CAN inject works on mipsel | same run, with `kmod-can-vcan`: bridge starts on vcan0 and injects, nothing rejected |
+| The app speaks the daemon's protocol | `TeleopSender.send()` byte-for-byte against `handle_udp_cmd()`: magic, version, flags, LE sequence, axes at 12/14/16, length 24 |
+
 ## Gate A — before opening the mt76 PR
 
 | # | Claim the patch makes | Measurement | Result |
@@ -89,6 +105,7 @@ should not sit in a public repo as if measured.
 | C3 | Zone reflexes fire within the stated latency | already measured on host (1.4 ms zone, 0.2 ms SSE); repeat on target | |
 | C4 | Mic capture works through the camera's USB audio | `arecord -l`, then listen | |
 | C5 | CAN needs `ip-full`; BusyBox `ip` cannot create the interface | verified on target: BusyBox `ip` rejects `type can` | ✅ |
+| C5b | The bridge comes up when the adapter is plugged in *after* boot | plug the USB-CAN adapter into a running router; `logread \| grep can-bridge` should show the hotplug rule starting it | |
 | C6 | Teleop deadman actually stops the vehicle | **do this with the wheels off the ground** | |
 
 C6 is the only item here with a physical consequence. Everything else is a
