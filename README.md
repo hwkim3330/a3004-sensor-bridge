@@ -5,6 +5,10 @@ camera and its microphone, an Ouster lidar on a gigabit port, optionally a
 USB-CAN adapter and a FlySky receiver, all visible on a dashboard that an
 Android tablet reaches over the router's own WiFi.
 
+The vehicle it is aimed at is an **AgileX SCOUT MINI Omni**: mecanum wheels, so
+holonomic. `can-bridge` decodes its CAN telemetry into named values and the
+teleop path carries three axes rather than two.
+
 The port this sits on top of was [openwrt#4915](https://github.com/openwrt/openwrt/pull/4915),
 written in 2022 and closed unmerged in 2023 over one driver defect. That defect
 is fixed here — see `doc/DBDC.md`.

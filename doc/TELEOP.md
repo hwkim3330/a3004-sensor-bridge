@@ -71,12 +71,23 @@ offset size  field
      8    4  uint32 sequence, increments every frame
     12    8  uint64 sender monotonic milliseconds
     20    8  4 x int16 axes, units of 1/10000, so -10000..10000 is -1.0..1.0
+              a0 strafe  (+ right)
+              a1 forward (+ forward)
+              a2 yaw     (+ anticlockwise, REP-103)
+              a3 spare
     28    2  uint16 buttons bitmask
     30    2  reserved
 ```
 
 Integer axes on purpose: no float parsing, no locale, no rounding disagreement
 between the browser, the daemon and the receiver.
+
+**Three axes, not two, because the vehicle is a SCOUT MINI Omni.** Mecanum wheels
+make translation and rotation independent, so a single two-axis stick would throw
+away a degree of freedom the machine has. Both clients give translation its own
+stick and yaw a separate horizontal one; the reference receiver maps a0 to
+`linear.y`, a1 to `linear.x` and a2 to `angular.z`. On a skid-steer vehicle a0
+simply has nothing to drive and whatever consumes the Twist ignores `linear.y`.
 
 The sequence number is what lets a receiver drop replays and count gaps. Note
 that a sender restart resets it to 1, so a receiver must treat a large backwards
@@ -133,8 +144,8 @@ python3 doc/pc-side/teleop_receiver.py --port 7720
 python3 doc/pc-side/teleop_receiver.py --port 7720 --ros
 ```
 
-`--max-linear` and `--max-angular` set what full stick deflection means. Start
-low.
+`--max-linear`, `--max-lateral` and `--max-angular` set what full deflection
+means. Start low.
 
 ## Where this must not go
 

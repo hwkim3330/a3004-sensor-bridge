@@ -24,6 +24,11 @@ Run it standalone to watch, or with --ros to publish geometry_msgs/Twist:
 Nothing here actuates anything. Wire the `on_command` callback to whatever does,
 and keep the rule that a not-live state means commanding zero, not commanding
 nothing.
+
+Axis map: a0 strafe (+right), a1 forward (+forward), a2 yaw (+anticlockwise).
+Three axes because a SCOUT MINI Omni is holonomic - translation and rotation are
+independent, and a two-axis stick would throw away a degree of freedom the
+vehicle actually has.
 """
 import argparse
 import socket
@@ -156,6 +161,10 @@ def main():
                     help="publish geometry_msgs/Twist on ~/cmd_vel")
     ap.add_argument("--max-linear", type=float, default=1.0,
                     help="metres per second at full axis deflection")
+    ap.add_argument("--max-lateral", type=float, default=1.0,
+                    help="metres per second sideways at full deflection. Only a "
+                         "mecanum platform can use this; on a skid vehicle "
+                         "linear.y is ignored by whatever consumes the Twist")
     ap.add_argument("--max-angular", type=float, default=1.5,
                     help="radians per second at full axis deflection")
     args = ap.parse_args()
@@ -175,9 +184,20 @@ def main():
             t = Twist()
             # Not live means publishing zero, not publishing nothing: a consumer
             # holding the last message would otherwise keep driving.
+            #
+            # Axis map, matching doc/TELEOP.md:
+            #   a0 strafe, + right     -> linear.y, negated for REP-103
+            #   a1 forward, + forward  -> linear.x
+            #   a2 yaw, + anticlockwise-> angular.z
+            #
+            # A SCOUT MINI Omni is holonomic, so translation and rotation are
+            # independent and all three are needed. Sending yaw on the same axis
+            # as strafe, as a two-axis stick has to, gives up a degree of freedom
+            # the vehicle has.
             if live:
                 t.linear.x = axes[1] * args.max_linear
-                t.angular.z = -axes[0] * args.max_angular
+                t.linear.y = -axes[0] * args.max_lateral
+                t.angular.z = axes[2] * args.max_angular
             pub.publish(t)
 
         rx.on_command = publish
@@ -205,7 +225,8 @@ def main():
             now = time.monotonic()
             if now - last_print > 0.25:
                 last_print = now
-                axes = " ".join(f"{a:+.2f}" for a in rx.axes)
+                axes = ("strafe %+.2f fwd %+.2f yaw %+.2f" %
+                        (rx.axes[0], rx.axes[1], rx.axes[2]))
                 print(f"\r{'LIVE ' if rx.live else 'zero '} [{axes}] "
                       f"btn={rx.buttons:04x} pkt={rx.stats['packets']} "
                       f"deadman={rx.stats['deadman']} gaps={rx.stats['gaps']} "

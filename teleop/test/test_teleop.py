@@ -128,13 +128,17 @@ def main():
         # ---- 2. arming and axis values ----
         print("\n--- armed ---")
         flush()
-        check("http status", cmd(arm=1, a0=5000, a1=-2500, b=5), 204)
+        # a0 strafe, a1 forward, a2 yaw - three axes because the vehicle is
+        # holonomic; see doc/TELEOP.md
+        check("http status", cmd(arm=1, a0=5000, a1=-2500, a2=7500, b=5), 204)
         time.sleep(0.15)
         f = drain(3)
         armed = [x for x in f if x["armed"]]
         check("armed frames seen", len(armed) >= 1, True)
-        check("axis0", armed[0]["axes"][0], 0.5)
-        check("axis1", armed[0]["axes"][1], -0.25)
+        check("a0 strafe", armed[0]["axes"][0], 0.5)
+        check("a1 forward", armed[0]["axes"][1], -0.25)
+        check("a2 yaw", armed[0]["axes"][2], 0.75)
+        check("a3 unused stays zero", armed[0]["axes"][3], 0.0)
         check("buttons", armed[0]["buttons"], 5)
 
         # ---- 3. clamping ----
@@ -223,8 +227,8 @@ def main():
         time.sleep(0.15)
         s5 = st()
         check("udp armed", s5["armed"], True)
-        check("udp axis0", s5["axes"][0], -0.6)
-        check("udp axis1", s5["axes"][1], 0.45)
+        check("udp a0 strafe", s5["axes"][0], -0.6)
+        check("udp a1 forward", s5["axes"][1], 0.45)
         check("udp commands counted", s5["udp_commands"] >= 6, True)
 
         flush()

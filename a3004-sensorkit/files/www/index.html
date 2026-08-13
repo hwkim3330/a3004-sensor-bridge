@@ -175,6 +175,29 @@ button.on { color: #0b0e13; background: var(--ok); border-color: var(--ok); }
 
 #tlWrap { grid-column: 1 / -1; }
 .tlBody { flex: none; display: flex; gap: 16px; padding: 12px 14px; align-items: center; flex-wrap: wrap; }
+.tlStickWrap { flex: none; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.tlCap { font-size: 10px; color: var(--dim); }
+/* Rotation gets its own control because the vehicle is holonomic: translation
+   and yaw are independent, and putting yaw on the same stick as strafe would
+   throw away a degree of freedom the mecanum wheels actually have. */
+#yaw {
+	width: 168px; height: 56px; flex: none;
+	border-radius: 28px; background: #10151d;
+	border: 1px solid var(--edge);
+	position: relative; touch-action: none;
+}
+#yaw::after {
+	content: ""; position: absolute; left: 50%; top: 8px; bottom: 8px;
+	width: 1px; background: #3d4859;
+}
+#yawKnob {
+	position: absolute; left: 50%; top: 50%;
+	width: 48px; height: 48px; margin: -24px 0 0 -24px;
+	border-radius: 50%; background: #2b3547;
+	border: 1px solid #3d4859;
+}
+#tlWrap.armed #yawKnob { background: var(--ok); border-color: var(--ok); }
+
 #stick {
 	width: 168px; height: 168px; flex: none;
 	border-radius: 50%; background: #10151d;
@@ -290,11 +313,19 @@ button.on { color: #0b0e13; background: var(--ok); border-color: var(--ok); }
 	<section class="card hidden" id="tlWrap">
 		<h2>Teleop<span class="sp"></span><span id="tlLabel">—</span></h2>
 		<div class="tlBody">
-			<div id="stick"><div id="knob"></div></div>
+			<div class="tlStickWrap">
+				<div id="stick"><div id="knob"></div></div>
+				<div class="tlCap">이동 (전후·좌우)</div>
+			</div>
+			<div class="tlStickWrap">
+				<div id="yaw"><div id="yawKnob"></div></div>
+				<div class="tlCap">회전</div>
+			</div>
 			<div class="tlSide">
 				<button id="armBtn">ARM</button>
-				<div class="tlNum"><span>전진/후진</span><b id="tlY">0.00</b></div>
-				<div class="tlNum"><span>좌/우</span><b id="tlX">0.00</b></div>
+				<div class="tlNum"><span>전후</span><b id="tlY">0.00</b></div>
+				<div class="tlNum"><span>좌우 (메카넘)</span><b id="tlX">0.00</b></div>
+				<div class="tlNum"><span>회전</span><b id="tlR">0.00</b></div>
 				<div class="tlNum"><span>deadman</span><b id="tlAge">—</b></div>
 				<div class="tlNote" id="tlNote"></div>
 			</div>
@@ -731,14 +762,17 @@ function rcPoll() {
    quiet is indistinguishable from a lost link, and the daemon must be able to
    tell the difference. */
 
-var tl = { armed: false, x: 0, y: 0, seq: 0, timer: null, dragging: false,
-	   armedAt: 0 };
+/* Axis map, shared with doc/TELEOP.md and the reference receiver:
+     a0 strafe (+right)   a1 forward (+forward)   a2 yaw (+anticlockwise) */
+var tl = { armed: false, x: 0, y: 0, r: 0, seq: 0, timer: null,
+	   dragging: false, yawDragging: false, armedAt: 0 };
 
 function tlSend() {
 	tl.seq++;
 	var q = "cmd?s=" + tl.seq + "&arm=" + (tl.armed ? 1 : 0) +
 		"&a0=" + Math.round(tl.x * 10000) +
-		"&a1=" + Math.round(tl.y * 10000);
+		"&a1=" + Math.round(tl.y * 10000) +
+		"&a2=" + Math.round(tl.r * 10000);
 	fetch(base + ":8083/" + q, { cache: "no-store" })
 		.catch(function () { /* the daemon's deadman handles this */ });
 }
@@ -756,6 +790,7 @@ function tlSetArmed(on) {
 		tlSend();                      /* disarm immediately, do not wait */
 		if (tl.timer) { clearInterval(tl.timer); tl.timer = null; }
 		tlCentre();
+		tlCentreYaw();
 	}
 }
 
@@ -764,6 +799,26 @@ function tlCentre() {
 	el("knob").style.transform = "translate(0,0)";
 	el("tlX").textContent = "0.00";
 	el("tlY").textContent = "0.00";
+}
+
+function tlCentreYaw() {
+	tl.r = 0;
+	el("yawKnob").style.transform = "translate(0,0)";
+	el("tlR").textContent = "0.00";
+}
+
+function tlYawMove(ev) {
+	if (!tl.yawDragging) return;
+	var r = el("yaw").getBoundingClientRect();
+	var p = ev.touches ? ev.touches[0] : ev;
+	var lim = r.width / 2 - 24;
+	var dx = Math.max(-lim, Math.min(lim, p.clientX - (r.left + r.width / 2)));
+
+	/* right on screen is clockwise, which is negative yaw under REP-103 */
+	tl.r = -dx / lim;
+	el("yawKnob").style.transform = "translate(" + dx.toFixed(0) + "px,0)";
+	el("tlR").textContent = tl.r.toFixed(2);
+	ev.preventDefault();
 }
 
 function tlMove(ev) {
@@ -788,11 +843,20 @@ function tlMove(ev) {
 (function () {
 	var st = el("stick");
 
+	var yw = el("yaw");
+
 	function down(ev) { tl.dragging = true; tlMove(ev); }
-	function up() { tl.dragging = false; tlCentre(); }
+	function up() {
+		tl.dragging = false; tlCentre();
+		tl.yawDragging = false; tlCentreYaw();
+	}
 
 	st.addEventListener("pointerdown", down);
 	st.addEventListener("pointermove", tlMove);
+	yw.addEventListener("pointerdown", function (ev) {
+		tl.yawDragging = true; tlYawMove(ev);
+	});
+	yw.addEventListener("pointermove", tlYawMove);
 	window.addEventListener("pointerup", up);
 	window.addEventListener("pointercancel", up);
 	/* Losing the tab is exactly the case the deadman exists for, but disarming
