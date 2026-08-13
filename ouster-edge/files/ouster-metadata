@@ -44,6 +44,24 @@ else
 	exit 1
 fi
 
+# The azimuth window lives in the config, not the data format. It matters more
+# than it looks: a sensor restricted to, say, [315000, 45000] does not send the
+# columns outside that arc, and their measurement ids are simply absent. Without
+# passing the window on, ouster-edge counts that absence as loss - on the bench a
+# perfectly healthy OS-1-64 reported 72% missing columns for exactly this reason.
+AZ_START=""
+AZ_END=""
+if fetch /api/v1/sensor/config; then
+	BASE='$'
+	AZ_START="$(get 'azimuth_window[0]')"
+	AZ_END="$(get 'azimuth_window[1]')"
+fi
+
+# Re-establish the data-format document and base that the fields below need,
+# since the config fetch above replaced both.
+if try /api/v1/sensor/metadata '$.data_format' || \
+   try /api/v1/sensor/metadata/lidar_data_format '$'; then :; fi
+
 COL="$(get columns_per_packet)"
 WIDTH="$(get columns_per_frame)"
 PROFILE="$(get udp_profile_lidar)"
@@ -52,3 +70,6 @@ echo "OUSTER_CHANNELS=${CH}"
 echo "OUSTER_COLUMNS=${COL:-16}"
 echo "OUSTER_SCAN_WIDTH=${WIDTH:-1024}"
 echo "OUSTER_PROFILE=${PROFILE:-LEGACY}"
+# Empty when the sensor sweeps the full circle, which is the common case.
+[ -n "$AZ_START" ] && [ -n "$AZ_END" ] && \
+	echo "OUSTER_AZ_WINDOW=${AZ_START}:${AZ_END}"

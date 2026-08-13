@@ -101,6 +101,8 @@ static struct {
 	/* configuration */
 	int listen_port;
 	int channels, columns, scan_width, sectors;
+	int az_win_start, az_win_end;	/* millidegrees, as the sensor reports;
+					 * -1,-1 means the full circle */
 	int ch_lo, ch_hi;
 	uint32_t min_range_mm, max_range_mm;
 	struct sockaddr_in relay_to, ring_to;
@@ -294,6 +296,34 @@ static void zones_index(void)
 				g.zone_mask[i] |= (uint16_t)(1u << z);
 		}
 	}
+}
+
+/*
+ * Is this column one the sensor is configured to emit?
+ *
+ * An Ouster with a restricted azimuth_window simply does not send the columns
+ * outside it, and their measurement ids are absent from the stream. Counting
+ * that absence as loss made a perfectly healthy OS-1-64 report 72% missing
+ * columns on the bench - it was set to [315000, 45000], a 90 degree window, and
+ * every revolution legitimately skipped three quarters of its ids.
+ *
+ * The window may wrap through zero, which is the normal case for one centred on
+ * straight ahead.
+ */
+static bool in_az_window(int mid)
+{
+	int lo, hi;
+
+	if (g.az_win_start < 0 || g.az_win_end < 0)
+		return true;
+
+	/* millidegrees -> measurement id */
+	lo = (int)(((long)g.az_win_start * g.scan_width) / 360000L);
+	hi = (int)(((long)g.az_win_end * g.scan_width) / 360000L);
+
+	if (lo <= hi)
+		return mid >= lo && mid <= hi;
+	return mid >= lo || mid <= hi;	/* wraps through 0 */
 }
 
 static void ring_reset(void)
@@ -593,6 +623,9 @@ static void status_write(void)
 		(unsigned long long)g.st.invalid_cols);
 	fprintf(f, "\t\"missed_columns\": %llu,\n",
 		(unsigned long long)g.st.gap_cols);
+	if (g.az_win_start >= 0)
+		fprintf(f, "\t\"azimuth_window\": [%d, %d],\n",
+			g.az_win_start, g.az_win_end);
 	fprintf(f, "\t\"zone_alarm\": %s,\n", g.zone_alarm ? "true" : "false");
 	fprintf(f, "\t\"zones\": [");
 	for (z = 0; z < g.nzones; z++)
@@ -697,7 +730,7 @@ static void packet_process(const uint8_t *pkt, size_t len, int txsock)
 		}
 
 		expected = (g.last_mid + 1) % g.scan_width;
-		if (g.last_mid >= 0 && mid != expected)
+		if (g.last_mid >= 0 && mid != expected && in_az_window(expected))
 			g.st.gap_cols += (mid - expected + g.scan_width) %
 					 g.scan_width;
 		g.last_mid = mid;
@@ -802,6 +835,8 @@ static bool parse_zone(const char *s)
 	return true;
 }
 
+enum { OPT_AZ_WINDOW = 1000 };
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
@@ -811,6 +846,10 @@ static void usage(const char *argv0)
 "  -C, --columns N          columns per packet (default 16)\n"
 "  -w, --scan-width N       columns per revolution: 512|1024|2048 (default 1024)\n"
 "  -s, --sectors N          azimuth sectors in the published ring (default 360)\n"
+"      --azimuth-window A:B the sensor's azimuth_window in millidegrees, e.g.\n"
+"                           315000:45000. Columns outside it are not sent by the\n"
+"                           sensor, so without this their absence is counted as\n"
+"                           loss and a healthy sensor reports missing columns\n"
 "  -b, --channel-band LO:HI channel range to reduce over (default all)\n"
 "  -m, --min-range M        ignore returns closer than this (default 0.3)\n"
 "  -M, --max-range M        ignore returns further than this (default 200)\n"
@@ -839,6 +878,7 @@ int main(int argc, char **argv)
 		{ "scan-width",   required_argument, NULL, 'w' },
 		{ "sectors",      required_argument, NULL, 's' },
 		{ "channel-band", required_argument, NULL, 'b' },
+		{ "azimuth-window", required_argument, NULL, OPT_AZ_WINDOW },
 		{ "min-range",    required_argument, NULL, 'm' },
 		{ "max-range",    required_argument, NULL, 'M' },
 		{ "relay",        required_argument, NULL, 'r' },
@@ -867,6 +907,8 @@ int main(int argc, char **argv)
 	g.columns = 16;
 	g.scan_width = 1024;
 	g.sectors = 360;
+	g.az_win_start = -1;
+	g.az_win_end = -1;
 	g.ch_lo = 0;
 	g.ch_hi = 127;
 	g.min_range_mm = 300;
@@ -885,6 +927,15 @@ int main(int argc, char **argv)
 		case 'C': g.columns = atoi(optarg); break;
 		case 'w': g.scan_width = atoi(optarg); break;
 		case 's': g.sectors = atoi(optarg); break;
+		case OPT_AZ_WINDOW:
+			if (sscanf(optarg, "%d:%d", &g.az_win_start,
+				   &g.az_win_end) != 2) {
+				fprintf(stderr,
+					"bad --azimuth-window '%s', want START:END in millidegrees\n",
+					optarg);
+				return 1;
+			}
+			break;
 		case 'b':
 			if (sscanf(optarg, "%d:%d", &g.ch_lo, &g.ch_hi) != 2) {
 				fprintf(stderr, "bad --channel-band '%s'\n", optarg);

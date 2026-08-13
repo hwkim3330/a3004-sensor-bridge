@@ -76,4 +76,37 @@ print(f"  -> {'PASS' if ok4 else 'FAIL'} "
       f"(expected invalid={COLS-1}, at most 1 log line)")
 os.remove(err)
 
-sys.exit(0 if (ok1 and ok2 and ok3 and ok4) else 1)
+print("Q5: an azimuth window means absent ids are not loss")
+# A sensor restricted to an arc does not send the columns outside it. Feed only
+# the ids inside a window and assert the daemon does not call the rest missing -
+# on real hardware this made a healthy OS-1-64 report 72% loss.
+if os.path.exists(STATUS): os.remove(STATUS)
+# The end is chosen so the window holds a whole number of packets. With 257 ids
+# and 16 columns per packet the last one cannot be sent, and the daemon is right
+# to count it - that off-by-one was the test's, not its.
+AZ = (315000, 44700)
+lo = AZ[0] * WIDTH // 360000
+hi = AZ[1] * WIDTH // 360000
+assert ((WIDTH - lo) + (hi + 1)) % COLS == 0, "window must hold whole packets"
+p = subprocess.Popen([BIN,"-f","-p",str(PORT),"-c",str(CH),"-C",str(COLS),
+    "-w",str(WIDTH),"-s","1024","-S",STATUS,"-I","50",
+    "--azimuth-window", f"{AZ[0]}:{AZ[1]}"], stderr=subprocess.DEVNULL)
+time.sleep(0.6)
+tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+inside = [m for m in range(WIDTH) if (m >= lo or m <= hi)]
+for frame in (11, 12):
+    for i in range(0, len(inside), COLS):
+        chunk = inside[i:i + COLS]
+        if len(chunk) < COLS:
+            break
+        tx.sendto(build(frame, chunk), ("127.0.0.1", PORT))
+        time.sleep(0.005)
+time.sleep(1.0)
+p.terminate(); p.wait(timeout=3)
+st = json.load(open(STATUS))
+print(f"  window {AZ}: missed_columns={st['missed_columns']} "
+      f"packets={st['packets']} azimuth_window={st.get('azimuth_window')}")
+ok5 = st['missed_columns'] == 0 and st['packets'] > 0
+print(f"  -> {'PASS' if ok5 else 'FAIL'} (expected 0 missed inside the window)")
+
+sys.exit(0 if (ok1 and ok2 and ok3 and ok4 and ok5) else 1)

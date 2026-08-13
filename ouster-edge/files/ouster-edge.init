@@ -26,6 +26,7 @@ append_zone() {
 start_service() {
 	local enabled port sensor_ip channels columns scan_width sectors
 	local channel_band min_range max_range relay ring status_interval action
+	local az_window
 
 	config_load ouster-edge
 	config_get_bool enabled lidar enabled 0
@@ -61,6 +62,7 @@ start_service() {
 			channels="${OUSTER_CHANNELS:-$channels}"
 			columns="${OUSTER_COLUMNS:-$columns}"
 			scan_width="${OUSTER_SCAN_WIDTH:-$scan_width}"
+			az_window="${OUSTER_AZ_WINDOW:-}"
 			logger -t ouster-edge \
 			  "sensor $sensor_ip reports ${channels}ch x ${columns}col, width ${scan_width}, profile ${OUSTER_PROFILE:-unknown}"
 		else
@@ -81,6 +83,7 @@ start_service() {
 		--status "$STATUS" \
 		--status-interval "$status_interval"
 
+	[ -n "$az_window" ] && procd_append_param command --azimuth-window "$az_window"
 	[ -n "$channel_band" ] && procd_append_param command --channel-band "$channel_band"
 	[ -n "$relay" ] && procd_append_param command --relay "$relay"
 	[ -n "$ring" ]  && procd_append_param command --ring "$ring"
