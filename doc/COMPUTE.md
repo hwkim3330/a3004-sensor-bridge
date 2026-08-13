@@ -152,6 +152,30 @@ What does spread:
 eth/mt76/xhci, and the current RPS masks, so the next time the board is powered
 this stops being an inference.
 
+### What full-rate lidar would cost the router
+
+Same method as the Xavier estimate: measure here, scale by clock and IPC, and
+label it a prediction. `ouster-edge` built native and fed the live sensor at
+`2048x10` — 1280 datagrams/s, zero missed columns — cost **24.5 and 25.6 µs of
+CPU per datagram at `-O2`**, and 31.6 and 33.9 at `-Os`, over two rounds each.
+
+A 1004Kc at 880 MHz against this Skylake core is a 5.6x clock deficit and
+roughly 0.35–0.4 of its work per clock, so call it **15x**:
+
+| build | per datagram | at 1280/s |
+|---|---|---|
+| `-O2` | ~375 µs | **~48% of one CPU** |
+| `-Os` | ~480 µs | ~61% of one CPU |
+
+Which is why the flag is worth the twenty-four bytes: it buys about thirteen
+points of a CPU that also has to run the ethernet RX softirq for 126 Mbit/s,
+because that softirq has nowhere else to go.
+
+So full rate through the router is plausible and not comfortable, and the ring
+it produces is 88 kbit/s either way. Measuring it for real needs the board
+powered, concurrently with the camera, and needs checking that `SO_RCVBUF` of
+4 MB survives `rmem_max`.
+
 ## The thing to do before either
 
 None of this is the binding constraint right now. **The vehicle does not move
