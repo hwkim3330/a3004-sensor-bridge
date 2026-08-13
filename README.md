@@ -31,7 +31,7 @@ is fixed here — see `doc/DBDC.md`.
 | `a3004-sensorkit` | pulls the rest in, configures them, and installs the dashboard |
 | `ouster-edge` | receives the lidar UDP stream, relays it verbatim, reduces each revolution to a range ring, evaluates polar zones per column |
 | `mic-stream` | serves a USB microphone as uncompressed PCM over HTTP |
-| `can-bridge` | bridges a SocketCAN interface to UDP, read-only unless told otherwise. Needs `ip-full`: BusyBox's `ip` cannot configure a CAN link |
+| `can-bridge` | bridges a SocketCAN interface to UDP, read-only unless told otherwise, and optionally decodes AgileX protocol v2 into named values. Needs `ip-full`: BusyBox's `ip` cannot configure a CAN link |
 | `rc-ibus` | decodes a FlySky receiver's i-BUS channel output |
 | `teleop` | takes joystick intent from the dashboard and forwards it with a deadman |
 | `rc-tx` | AFHDS 2A frame building — the half that needs no radio (not an installable package) |
@@ -63,7 +63,8 @@ python3 test_zones.py          # zone confirmation and hysteresis
 sh    test_metadata.sh         # the sensor HTTP metadata probe
 
 cd ../../can-bridge/test
-cc -O2 -Wall -Wextra -o can-bridge ../src/can-bridge.c
+cc -O2 -Wall -Wextra -o can-bridge ../src/can-bridge.c ../src/agilex.c
+cc -O2 -Wall -Wextra -std=c99 -o test_agilex test_agilex.c ../src/agilex.c && ./test_agilex
 sudo modprobe vcan
 sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
 python3 test_bridge.py
