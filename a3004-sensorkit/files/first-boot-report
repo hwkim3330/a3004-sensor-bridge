@@ -71,11 +71,26 @@ say "uci wireless as generated:"
 uci show wireless 2>/dev/null | grep -E "radio[0-9]+\.(band|path|channel|htmode)" | sed 's/^/    /'
 
 hdr "QUESTION 2: what does the EEPROM say?"
-say "0x3e bits 5:4 are the band config the driver reads."
-say "  00 dual band (what this board reports, and the bug)"
-say "  11 DBDC"
+say "MT_EE_WIFI_CONF (0x3e) bits 5:4 are the band config the driver reads."
+say "This is the measurement the mt76 patch rests on, so it is printed as the"
+say "field value rather than the raw byte - shifting it by hand is where a"
+say "misreading would get into a commit message."
 V=$(hexdump -e '1/1 "%02x"' -s 62 -n 1 /dev/mtd2 2>/dev/null)
-say "  byte at 0x3e: 0x${V:-??}"
+say "  byte at 0x3e:  0x${V:-??}"
+if [ -n "$V" ]; then
+	B=$((0x$V)); F=$(((B >> 4) & 3))
+	case "$F" in
+	0) N="MT_EE_DUAL_BAND - one phy, both bands, ONE AT A TIME (patch needed)";;
+	1) N="MT_EE_5GHZ - 5 GHz only";;
+	2) N="MT_EE_2GHZ - 2.4 GHz only";;
+	3) N="MT_EE_DBDC - two phys already; THE PATCH IS UNNECESSARY HERE";;
+	esac
+	say "  band_sel:      $F  ($N)"
+	say ""
+	say "If band_sel is 3 the premise of the mt76 patch is wrong for this board"
+	say "and the 2023 port stalled for some other reason. Do not open the mt76"
+	say "PR in that case - find out what actually blocks the second phy first."
+fi
 say ""
 say "MT_EE_NIC_CONF_0 (0x34) sets the chainmask, which decides whether the"
 say "DBDC split is 2x2+2x2 or 1x1+1x1. Expected 2x2+2x2, never read:"
