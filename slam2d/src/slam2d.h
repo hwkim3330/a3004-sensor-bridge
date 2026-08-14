@@ -126,4 +126,32 @@ void s2_map_build_pyramid(struct s2_map *m);
 /* Write the map as a binary PGM, for looking at it. Debug only. */
 bool s2_map_write_pgm(const struct s2_map *m, const char *path);
 
+/*
+ * Write map, geometry and pose as one file for a client to draw.
+ *
+ * One fetch rather than three, because a tablet drawing a map needs the cells,
+ * the transform that places them in the world, and where the robot is, and any
+ * mismatch between those three is a picture with the robot in the wrong place.
+ * Sending them together makes that impossible rather than unlikely.
+ *
+ * `level` picks the pyramid level, so the caller chooses resolution against
+ * bandwidth: level 0 of a 40 m map at 5 cm is 640 kB, level 2 is 40 kB, and over
+ * WiFi at a few frames a second only one of those is sensible.
+ *
+ *   0  4  magic "S2MP"
+ *   4  1  version, currently 1
+ *   5  1  level
+ *   6  2  width in cells, uint16 LE
+ *   8  2  height in cells
+ *  10  2  cell size in centimetres
+ *  12  4  origin x of cell (0,0) in centimetres, int32 LE
+ *  16  4  origin y
+ *  20  4  pose x in centimetres
+ *  24  4  pose y
+ *  28  4  pose heading, 1/4096 of a revolution
+ *  32  w*h  occupancy, row 0 at the bottom, 0 free .. 128 unknown .. 255 occupied
+ */
+bool s2_map_write_export(const struct s2_map *m, const struct s2_pose *p,
+			 int level, const char *path);
+
 #endif /* SLAM2D_H */

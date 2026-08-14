@@ -4,7 +4,7 @@ START=93
 USE_PROCD=1
 
 start_service() {
-	local enabled port map_size res maxr win wina minret sint mpath mint
+	local enabled port map_size res maxr win wina minret sint mpath mint mexp mlvl
 
 	config_load slam2d
 	config_get_bool enabled map enabled 0
@@ -22,6 +22,8 @@ start_service() {
 	config_get minret       map min_returns    40
 	config_get sint         map status_interval 500
 	config_get mpath        map map_path
+	config_get mexp         map map_export
+	config_get mlvl         map map_level        2
 	config_get mint         map map_interval   5000
 
 	# A ring that is a minimum over every beam maps the floor, not the room.
@@ -38,6 +40,7 @@ start_service() {
 		-p "$port" -m "$map_size" -r "$res" -R "$maxr" \
 		-w "$win" -a "$wina" -n "$minret" -I "$sint"
 	[ -n "$mpath" ] && procd_append_param command -M "$mpath" -T "$mint"
+	[ -n "$mexp" ] && procd_append_param command -X "$mexp" -L "$mlvl"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1

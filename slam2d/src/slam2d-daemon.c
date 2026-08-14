@@ -54,6 +54,8 @@ static struct {
 	int32_t min_returns;
 	char *status_path;
 	char *map_path;
+	char *map_export;
+	int map_level;
 	int status_ms;
 	int map_ms;
 	bool foreground;
@@ -256,6 +258,8 @@ static const char usage[] =
 "  -I, --status-interval MS  how often to write it (default 500)\n"
 "  -M, --map PATH         periodically write the map as a PGM\n"
 "  -T, --map-interval MS  how often to write it (default 5000)\n"
+"  -X, --map-export PATH  map, geometry and pose in one file for a client\n"
+"  -L, --map-level N      which pyramid level to export (default 2, 20 cm)\n"
 "  -f, --foreground       log to stderr\n"
 "  -h, --help             this text\n"
 "\n"
@@ -277,6 +281,8 @@ int main(int argc, char **argv)
 		{ "status-interval", required_argument, NULL, 'I' },
 		{ "map",             required_argument, NULL, 'M' },
 		{ "map-interval",    required_argument, NULL, 'T' },
+		{ "map-export",      required_argument, NULL, 'X' },
+		{ "map-level",       required_argument, NULL, 'L' },
 		{ "foreground",      no_argument,       NULL, 'f' },
 		{ "help",            no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -296,8 +302,9 @@ int main(int argc, char **argv)
 	g.status_path = (char *)"/var/run/slam2d.json";
 	g.status_ms = 500;
 	g.map_ms = 5000;
+	g.map_level = 2;
 
-	while ((c = getopt_long(argc, argv, "p:m:r:R:w:a:n:S:I:M:T:fh", opts,
+	while ((c = getopt_long(argc, argv, "p:m:r:R:w:a:n:S:I:M:T:X:L:fh", opts,
 				NULL)) != -1) {
 		switch (c) {
 		case 'p': g.port = atoi(optarg); break;
@@ -311,6 +318,8 @@ int main(int argc, char **argv)
 		case 'I': g.status_ms = atoi(optarg); break;
 		case 'M': g.map_path = optarg; break;
 		case 'T': g.map_ms = atoi(optarg); break;
+		case 'X': g.map_export = optarg; break;
+		case 'L': g.map_level = atoi(optarg); break;
 		case 'f': g.foreground = true; break;
 		case 'h': fputs(usage, stdout); return 0;
 		default:  fputs(usage, stderr); return 2;
@@ -378,6 +387,15 @@ int main(int argc, char **argv)
 		if (g.map_path && t - last_map >= (uint64_t)g.map_ms) {
 			last_map = t;
 			s2_map_write_pgm(&g.map, g.map_path);
+		}
+		if (g.map_export && t - last_status < 2) {
+			/* Alongside the status, so a client polling both sees
+			 * one instant rather than two. The exported level is a
+			 * pyramid level and only s2_match rebuilds those. */
+			if (g.map.dirty)
+				s2_map_build_pyramid(&g.map);
+			s2_map_write_export(&g.map, &g.pose, g.map_level,
+					    g.map_export);
 		}
 	}
 

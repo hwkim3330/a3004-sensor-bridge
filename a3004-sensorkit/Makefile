@@ -8,7 +8,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=a3004-sensorkit
 PKG_VERSION:=1.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=KETI
@@ -53,6 +53,12 @@ define Package/a3004-sensorkit/install
 	$(LN) /var/run/can-bridge.json $(1)/www/sensors/can.json
 	$(LN) /var/run/rc-ibus.json $(1)/www/sensors/rc.json
 	$(LN) /var/run/teleop.json $(1)/www/sensors/teleop.json
+	# The map is a binary blob rather than JSON on purpose: 40 kB of cells
+	# at level 2, against about 400 kB if the same grid went out as numbers.
+	# See slam2d.h for the header.
+	$(LN) /var/run/slam2d.json $(1)/www/sensors/slam2d.json
+	$(LN) /var/run/navigate.json $(1)/www/sensors/navigate.json
+	$(LN) /var/run/map.s2mp $(1)/www/sensors/map.s2mp
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/sensor-probe $(1)/usr/sbin/sensor-probe

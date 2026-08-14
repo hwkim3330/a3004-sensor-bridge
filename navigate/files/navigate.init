@@ -4,7 +4,7 @@ START=94
 USE_PROCD=1
 
 start_service() {
-	local enabled tele rp cp msz res maxr rad arr lin yaw score stall rto
+	local enabled tele rp cp msz res maxr rad arr lin yaw score stall rto mexp mlvl
 
 	config_load navigate
 	config_get_bool enabled nav enabled 0
@@ -26,6 +26,8 @@ start_service() {
 	config_get score nav min_score_pct    25
 	config_get stall nav stall_ms         8000
 	config_get rto   nav ring_timeout_ms  1000
+	config_get mexp  nav map_export
+	config_get mlvl  nav map_level        2
 
 	[ -n "$tele" ] && logger -t navigate \
 		"ENABLED: commanding a vehicle through agx-cmd at $tele"
@@ -39,6 +41,7 @@ start_service() {
 		-b "$rad" -g "$arr" -l "$lin" -y "$yaw" \
 		-s "$score" -k "$stall" -t "$rto"
 	[ -n "$tele" ] && procd_append_param command -T "$tele"
+	[ -n "$mexp" ] && procd_append_param command -X "$mexp" -L "$mlvl"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1

@@ -584,6 +584,60 @@ bool s2_match(struct s2_map *m, const struct s2_pose *seed,
 
 /* ---------------------------------------------------------------- output */
 
+static void put_le16(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+}
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v;
+	p[1] = (uint8_t)(v >> 8);
+	p[2] = (uint8_t)(v >> 16);
+	p[3] = (uint8_t)(v >> 24);
+}
+
+bool s2_map_write_export(const struct s2_map *m, const struct s2_pose *p,
+			 int level, const char *path)
+{
+	uint8_t hdr[32];
+	char tmp[256];
+	FILE *f;
+	size_t n;
+
+	if (level < 0 || level >= S2_LEVELS || !m->cell[level])
+		return false;
+
+	memcpy(hdr, "S2MP", 4);
+	hdr[4] = 1;
+	hdr[5] = (uint8_t)level;
+	put_le16(hdr + 6, (uint32_t)m->w[level]);
+	put_le16(hdr + 8, (uint32_t)m->h[level]);
+	put_le16(hdr + 10, (uint32_t)(m->res_cm << level));
+	put_le32(hdr + 12, (uint32_t)m->origin_x_cm);
+	put_le32(hdr + 16, (uint32_t)m->origin_y_cm);
+	put_le32(hdr + 20, (uint32_t)(p ? p->x_cm : 0));
+	put_le32(hdr + 24, (uint32_t)(p ? p->y_cm : 0));
+	put_le32(hdr + 28, (uint32_t)(p ? p->a : 0));
+
+	/* Written aside and renamed, so a client polling this never reads a
+	 * half-written map and draws a torn one. */
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	f = fopen(tmp, "wb");
+	if (!f)
+		return false;
+	n = (size_t)m->w[level] * m->h[level];
+	if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+	    fwrite(m->cell[level], 1, n, f) != n) {
+		fclose(f);
+		remove(tmp);
+		return false;
+	}
+	fclose(f);
+	return rename(tmp, path) == 0;
+}
+
 bool s2_map_write_pgm(const struct s2_map *m, const char *path)
 {
 	FILE *f = fopen(path, "wb");

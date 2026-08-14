@@ -102,6 +102,8 @@ static struct {
 
 	char *status_path;
 	char *plan_dump;
+	char *map_export;
+	int map_level;
 	int status_ms;
 	bool foreground;
 	bool dry_run;
@@ -813,6 +815,8 @@ static const char usage[] =
 "  -I, --status-interval MS (default 500)\n"
 "  -D, --dry-run            plan and report, never send TELE\n"
 "  -P, --plan-dump PATH     write the planner's blocked/free view as a PGM\n"
+"  -X, --map-export PATH    map, geometry and pose in one file for a client\n"
+"  -L, --map-level N        which pyramid level to export (default 2, 20 cm)\n"
 "  -f, --foreground         log to stderr\n"
 "  -h, --help               this text\n"
 "\n"
@@ -842,6 +846,8 @@ int main(int argc, char **argv)
 		{ "status-interval", required_argument, NULL, 'I' },
 		{ "dry-run",         no_argument,       NULL, 'D' },
 		{ "plan-dump",       required_argument, NULL, 'P' },
+		{ "map-export",      required_argument, NULL, 'X' },
+		{ "map-level",       required_argument, NULL, 'L' },
 		{ "foreground",      no_argument,       NULL, 'f' },
 		{ "help",            no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -867,9 +873,10 @@ int main(int argc, char **argv)
 	g.min_returns = 40;
 	g.status_path = (char *)"/var/run/navigate.json";
 	g.status_ms = 500;
+	g.map_level = 2;
 
 	while ((c = getopt_long(argc, argv,
-				"p:c:T:m:r:R:w:a:b:g:s:l:y:k:t:n:S:I:P:Dfh",
+				"p:c:T:m:r:R:w:a:b:g:s:l:y:k:t:n:S:I:P:X:L:Dfh",
 				opts, NULL)) != -1) {
 		switch (c) {
 		case 'p': g.ring_port = atoi(optarg); break;
@@ -898,6 +905,8 @@ int main(int argc, char **argv)
 		case 'I': g.status_ms = atoi(optarg); break;
 		case 'D': g.dry_run = true; break;
 		case 'P': g.plan_dump = optarg; break;
+		case 'X': g.map_export = optarg; break;
+		case 'L': g.map_level = atoi(optarg); break;
 		case 'f': g.foreground = true; break;
 		case 'h': fputs(usage, stdout); return 0;
 		default:  fputs(usage, stderr); return 2;
@@ -976,6 +985,17 @@ int main(int argc, char **argv)
 		if (t - last_status >= (uint64_t)g.status_ms) {
 			last_status = t;
 			status_write();
+			if (g.map_export) {
+				/* The exported level is a pyramid level, and
+				 * s2_match only rebuilds those when it runs. A
+				 * client polling faster than the vehicle moves
+				 * would otherwise be shown a map one revolution
+				 * stale for no reason. */
+				if (g.map.dirty)
+					s2_map_build_pyramid(&g.map);
+				s2_map_write_export(&g.map, &g.pose,
+						    g.map_level, g.map_export);
+			}
 		}
 	}
 
