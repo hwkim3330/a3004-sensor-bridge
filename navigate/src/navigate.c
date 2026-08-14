@@ -66,6 +66,41 @@
 #define STEP_ORTHO	10
 #define STEP_DIAG	14
 
+/*
+ * Why a plan could not be made.
+ *
+ * "unreachable" was one string for four different situations, and on real data
+ * the one that actually happened was the one it described worst: a destination
+ * in free space but within the robot's radius of a wall is refused, correctly,
+ * and telling someone who just tapped it "unreachable or not on mapped ground"
+ * gives them nothing to do about it. Which of these it is decides whether to
+ * tap somewhere else, drive closer first, or look at the map.
+ */
+enum plan_fail {
+	PLAN_OK,
+	PLAN_OFF_MAP,		/* outside the grid entirely */
+	PLAN_NO_FREE,		/* nothing has been mapped yet */
+	PLAN_GOAL_BLOCKED,	/* on, or within the robot's radius of, an obstacle */
+	PLAN_NO_MEMORY,
+};
+
+static const char *plan_fail_text(enum plan_fail f)
+{
+	switch (f) {
+	case PLAN_OFF_MAP:
+		return "that point is outside the map";
+	case PLAN_NO_FREE:
+		return "nothing has been mapped yet";
+	case PLAN_GOAL_BLOCKED:
+		return "that point is inside an obstacle, or closer to one than "
+		       "the vehicle's radius";
+	case PLAN_NO_MEMORY:
+		return "planner out of memory";
+	default:
+		return "planning failed";
+	}
+}
+
 enum state {
 	ST_IDLE,			/* no goal */
 	ST_DRIVING,
@@ -314,7 +349,7 @@ static bool build_blocked(uint8_t *blocked)
  * cell can be re-relaxed many times and the queue overflows - on 200x200 cells
  * that is the difference between a plan and a truncated one.
  */
-static bool plan(void)
+static enum plan_fail plan_reason(void)
 {
 	int32_t w = plan_w(), h = plan_h(), n = w * h;
 	static uint8_t *blocked, *inq;
@@ -324,7 +359,7 @@ static bool plan(void)
 	int32_t i;
 
 	if (gx < 0 || gy < 0 || gx >= w || gy >= h)
-		return false;
+		return PLAN_OFF_MAP;
 
 	/*
 	 * The pyramid the planner reads is only rebuilt by s2_match, and the
@@ -345,12 +380,14 @@ static bool plan(void)
 		inq = malloc((size_t)n);
 		alloc_n = (blocked && inq) ? n : 0;
 	}
-	if (!blocked || !inq || !build_blocked(blocked))
-		return false;
+	if (!blocked || !inq)
+		return PLAN_NO_MEMORY;
+	if (!build_blocked(blocked))
+		return PLAN_NO_FREE;
 	if (g.plan_dump)
 		dump_plan(blocked, g.plan_dump);
 	if (!blocked[gy * w + gx])
-		return false;			/* goal is inside an obstacle */
+		return PLAN_GOAL_BLOCKED;
 
 	for (i = 0; i < n; i++) {
 		g.cost[i] = BLOCKED;
@@ -397,7 +434,12 @@ static bool plan(void)
 		}
 	}
 	g.replans++;
-	return true;
+	return PLAN_OK;
+}
+
+static bool plan(void)
+{
+	return plan_reason() == PLAN_OK;
 }
 
 /*
@@ -695,10 +737,19 @@ static void handle_cmd(char *line)
 		g.best_remaining_cm = 0x7FFFFFFF;
 		g.last_progress_ms = now_ms();
 		g.fault = NULL;
-		if (!plan()) {
-			halt(ST_BLOCKED_FAULT,
-			     "goal is unreachable or not on mapped ground");
-			return;
+		{
+			enum plan_fail f = plan_reason();
+
+			if (f != PLAN_OK) {
+				/* Kept in a static so halt()'s pointer stays
+				 * valid; the text itself is a literal. */
+				static const char *why;
+
+				why = plan_fail_text(f);
+				g.have_goal = false;
+				halt(ST_BLOCKED_FAULT, why);
+				return;
+			}
 		}
 		g.state = ST_DRIVING;
 		logmsg(LOG_NOTICE, "goal set to %d,%d cm", (int)x, (int)y);

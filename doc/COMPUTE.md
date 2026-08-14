@@ -323,6 +323,38 @@ Whichever host, the robot needs only to execute velocity commands, which
 `agx-cmd` already encodes, and to stop by itself when the link goes quiet, which
 `teleop`'s deadman and `ouster-edge`'s zones already do.
 
+### On real lidar, finally
+
+Everything above was simulated until the sensor was plugged into this desktop.
+What the first real run found is worth keeping, because none of it was visible
+in simulation:
+
+- **The sensor's stored configuration is not to be trusted.** Its
+  `azimuth_window` was at 90 degrees, so two thirds of the packets were never
+  sent, ouster-edge counted 124475 missed columns, the ring was empty and slam2d
+  matched nothing - with every daemon reporting healthy statistics about
+  nothing. `ouster-configure` now asserts the configuration at every start, and
+  reads `beam_altitude_angles` to pick the horizontal rows, which on this sensor
+  are 28:33.
+- With the window restored: 277 packets/s, **zero missed columns**, 175 of 360
+  sectors returning, and slam2d matching **all 266 revolutions at 91%** with no
+  drift over thirty seconds from a stationary sensor. The map is a real room,
+  7.0 x 6.6 m.
+- Moving the sensor by hand: the ring changed by up to 101 cm, and the pose
+  followed it - 58 degrees of heading and about 20 cm of translation. The match
+  score fell to 35% during the movement and recovered to 85%, which is exactly
+  the signal `navigate`'s `min_score_pct` watcher exists to catch. There is no
+  ground truth here, so this says the pose responds coherently to real motion,
+  not how accurately.
+- `navigate` on the real map: 302 of the points within 3 m are valid
+  destinations once the robot's radius is respected. Given one at 2.33 m it
+  planned a **7.88 m** route around the real clutter, commanded, and then stopped
+  itself with *no progress towards the goal* when nothing moved - because there
+  is no vehicle. The stall watcher works on real data.
+
+The measured cost on real data is **844 us per scan**, against 950 in the
+simulated room.
+
 ### What is missing regardless of where it runs
 
 - **Odometry.** Scan matching alone drifts; SLAM wants wheel odometry as a prior.
