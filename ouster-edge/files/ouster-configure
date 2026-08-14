@@ -30,8 +30,17 @@ APPLY=""
 TMP="/tmp/ouster-configure.$$"
 trap 'rm -f "$TMP" "$TMP".b' EXIT
 
+# uclient-fetch, not curl.
+#
+# curl is not in this image and never was; ouster-metadata beside this file
+# already used uclient-fetch. Written with curl because that is what the
+# development machine has, and it failed on the router with "cannot reach
+# 192.168.1.50" while ouster-edge was talking to the same sensor perfectly.
+FETCH="uclient-fetch -q -T 6 -O"
+command -v uclient-fetch >/dev/null 2>&1 || FETCH="wget -q -T 6 -O"
+
 get_cfg() {
-	curl -s -m 8 "http://$HOST/api/v1/sensor/config" > "$TMP" 2>/dev/null || return 1
+	$FETCH "$TMP" "http://$HOST/api/v1/sensor/config" 2>/dev/null || return 1
 	[ -s "$TMP" ]
 }
 
@@ -80,8 +89,11 @@ fi
 
 if [ -n "$BODY" ]; then
 	if [ -n "$APPLY" ]; then
-		curl -s -m 10 -X POST -H 'Content-Type: application/json' \
-			-d "{$BODY}" "http://$HOST/api/v1/sensor/config" >/dev/null
+		# uclient-fetch cannot POST, so the one write this script does goes
+		# through wget's --post-data, which busybox wget supports.
+		wget -q -O /dev/null --header='Content-Type: application/json' \
+			--post-data="{$BODY}" \
+			"http://$HOST/api/v1/sensor/config" 2>/dev/null
 		# The sensor reinitialises, which takes a few seconds and drops the
 		# stream while it does. Waiting here means whatever starts next sees
 		# a sensor that is already right.
@@ -104,7 +116,7 @@ fi
 # beam_altitude_angles is one angle per channel, and they are neither evenly
 # spaced nor centred on the array's middle. Reading them is the only way to know
 # which rows look straight ahead.
-if curl -s -m 8 "http://$HOST/api/v1/sensor/metadata/beam_intrinsics" > "$TMP".b 2>/dev/null; then
+if $FETCH "$TMP".b "http://$HOST/api/v1/sensor/metadata/beam_intrinsics" 2>/dev/null; then
 	# jsonfilter prints one element per line, which is the only reason this
 	# does not need a JSON parser in awk. An earlier attempt split the whole
 	# document on brackets and commas and silently mixed the altitude angles
