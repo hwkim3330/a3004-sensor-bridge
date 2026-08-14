@@ -249,24 +249,52 @@ Also worth knowing: 360 sectors is 1°, which is 20 cm of arc at 12 m. Fine for 
 5 cm grid nearby and coarse far away. `--sectors 720` halves that and doubles the
 88 kbit/s, which is still nothing.
 
-### Where it runs, and why not on the router
+### Where it runs — answered by removing the constraint
 
-Not on the router, and the reason is not the point count — it is
-**`CONFIG_SOFT_FLOAT=y`**. MT7621 has no FPU, so every floating-point operation
-is a libgcc call. Scan matching is almost entirely floating point. Scaled by the
-same 15x used above, 2.5 ms becomes ~39 ms, which would fit; multiply that by a
-soft-float penalty and it does not. The router has no ROS either, and 4.7 MiB of
-overlay.
+The obvious blocker was **`CONFIG_SOFT_FLOAT=y`**. MT7621 has no FPU, so every
+floating-point operation is a libgcc call, and a conventional scan matcher is
+almost nothing but floating point.
 
-**The tablet is the natural place.** It has an FPU and NEON, it is already
-receiving the ring, and it is already where a destination would be tapped. The
-robot then needs only to execute velocity commands, which `agx-cmd` already
-encodes, and to stop by itself when the link goes quiet, which `teleop`'s deadman
-and `ouster-edge`'s zones already do. That reflex layer is what makes running the
-planner off-vehicle defensible rather than reckless.
+So the matcher was written without any. `package/keti/slam2d` is a correlative
+scan matcher over an image pyramid, in integers throughout: ranges in
+centimetres, angles in 1/4096 of a revolution, trigonometry from a Q15 table
+built once by CORDIC. `objdump` on the core object finds **zero** floating-point
+instructions and zero soft-float calls. The algorithm choice follows from the
+constraint rather than fighting it — ICP needs an SVD per iteration, which is
+unpleasant in fixed point, while scoring candidate poses against an occupancy
+grid is a sum of table lookups.
 
-The alternative is one of the Xavier boxes above with ROS 2 and slam_toolbox plus
-nav2, which is the conventional answer and brings the JetPack 5 problem with it.
+Measured against a simulated room with known ground truth, 120 scans:
+
+| | |
+|---|---|
+| position error | mean **5.3 cm**, worst 9.2 cm |
+| heading error | worst 2.4° |
+| match cost | **1.7 ms** per scan, 675 candidate poses |
+| CORDIC sine vs libm | worst 0.00026 |
+
+Cross-compiled and run under the emulator, mipsel produced **identical** figures
+— 5.3 cm mean, 9.2 cm worst, 2.4° — which is the point of an integer core: the
+router and the tablet cannot disagree about where the robot is. Scaled by the
+same 15x, 1.7 ms becomes ~26 ms, comfortably inside the 100 ms budget, and
+without a soft-float penalty because there is no float to penalise. That number
+is a prediction until the board is powered; what the emulator establishes is
+correctness, not speed.
+
+So all three hosts are now open, and the choice is about where the map and the
+planner should live rather than about who can do the arithmetic:
+
+- **the router**, which already has the ring in memory and would not have to send
+  it anywhere
+- **the tablet**, which has an FPU and NEON going spare, is already receiving the
+  ring, and is already where a destination would be tapped
+- **a Xavier** with ROS 2, slam_toolbox and nav2, which is the conventional answer
+  and brings the JetPack 5 problem with it
+
+Whichever it is, the robot needs only to execute velocity commands, which
+`agx-cmd` already encodes, and to stop by itself when the link goes quiet, which
+`teleop`'s deadman and `ouster-edge`'s zones already do. That reflex layer is
+what makes running a planner off-vehicle defensible rather than reckless.
 
 ### What is missing regardless of where it runs
 
