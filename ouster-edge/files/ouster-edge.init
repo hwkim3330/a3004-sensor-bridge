@@ -25,7 +25,7 @@ append_zone() {
 
 start_service() {
 	local enabled port sensor_ip channels columns scan_width sectors
-	local channel_band min_range max_range relay ring status_interval action
+	local channel_band min_range max_range relay ring status_interval action r
 	local az_window
 
 	config_load ouster-edge
@@ -111,7 +111,12 @@ start_service() {
 	[ -n "$az_window" ] && procd_append_param command --azimuth-window "$az_window"
 	[ -n "$channel_band" ] && procd_append_param command --channel-band "$channel_band"
 	[ -n "$relay" ] && procd_append_param command --relay "$relay"
-	[ -n "$ring" ]  && procd_append_param command --ring "$ring"
+	# One --ring per destination. A list here rather than a single value
+	# because the on-router mapper and the operator's screen both want it, and
+	# with one destination choosing either silently blanks the other.
+	for r in $ring; do
+		procd_append_param command --ring "$r"
+	done
 	[ -n "$action" ] && procd_append_param command --action "$action"
 
 	config_foreach append_zone zone

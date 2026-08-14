@@ -96,6 +96,39 @@ if [ -z "$band1" ]; then
 	logger -t sensorkit "WARNING: only one radio present - DBDC override is not active, see doc/DBDC.md"
 fi
 
+#
+# The access points themselves.
+#
+# Enabling the radios is not enough: OpenWrt's default interfaces stay disabled
+# with the SSID "OpenWrt" and no encryption, so a tablet looking for this router
+# finds nothing and the one that matters - the app's AP button - has nothing to
+# join. Every other surface in this kit was configured here and this one was not.
+#
+# Named per band from what the driver reports, so the 5 GHz one is the 5 GHz one
+# whichever phy it landed on. The passphrase is a default for a bench device, not
+# a secret; if this is ever pointed at something that matters, change it here and
+# in the app together.
+for r in 0 1; do
+	uci -q get wireless.radio$r >/dev/null || continue
+	band="$(uci -q get wireless.radio$r.band)"
+	case "$band" in
+		5g) name="A3004-5G" ;;
+		2g) name="A3004-2G" ;;
+		*)  name="A3004-$r" ;;
+	esac
+	sec="$(uci -q show wireless | sed -n "s/^wireless\.\(default_radio$r\)=wifi-iface$/\1/p")"
+	[ -n "$sec" ] || sec="default_radio$r"
+	uci -q set wireless.$sec=wifi-iface
+	uci -q set wireless.$sec.device="radio$r"
+	uci -q set wireless.$sec.network='lan'
+	uci -q set wireless.$sec.mode='ap'
+	uci -q set wireless.$sec.ssid="$name"
+	uci -q set wireless.$sec.encryption='psk2'
+	uci -q set wireless.$sec.key='keti12345678'
+	uci -q set wireless.$sec.disabled='0'
+	logger -t sensorkit "access point $name on radio$r (${band:-unknown band})"
+done
+
 uci -q commit wireless
 
 # --- microphone -----------------------------------------------------------

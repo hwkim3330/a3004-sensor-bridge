@@ -105,8 +105,22 @@ static struct {
 					 * -1,-1 means the full circle */
 	int ch_lo, ch_hi;
 	uint32_t min_range_mm, max_range_mm;
-	struct sockaddr_in relay_to, ring_to;
-	bool have_relay, have_ring;
+	struct sockaddr_in relay_to;
+	bool have_relay;
+
+	/*
+	 * More than one ring destination.
+	 *
+	 * One was enough while the only consumer was a tablet. It stopped being
+	 * enough the moment slam2d ran on the router itself: the ring went to
+	 * 127.0.0.1 for the mapper and the operator's screen went blank, with
+	 * nothing wrong anywhere. The ring is 1100 bytes at 10 Hz, so sending it
+	 * to a handful of places costs nothing worth measuring and removes a
+	 * choice nobody should have to make.
+	 */
+#define MAX_RING_DEST	4
+	struct sockaddr_in ring_to[MAX_RING_DEST];
+	int nring;
 	char *status_path;
 	char *action;
 	struct zone zones[MAX_ZONES];
@@ -446,7 +460,7 @@ static void ring_publish(int sock)
 	size_t off = 0;
 	int i;
 
-	if (!g.have_ring)
+	if (!g.nring)
 		return;
 
 	buf[0] = RING_MAGIC & 0xff;
@@ -473,8 +487,9 @@ static void ring_publish(int sock)
 	for (i = 0; i < g.sectors; i++)
 		buf[off++] = g.ring_refl_pub[i];
 
-	if (sendto(sock, buf, off, 0, (struct sockaddr *)&g.ring_to,
-		   sizeof(g.ring_to)) < 0 && errno != EAGAIN)
+	for (i = 0; i < g.nring; i++)
+		if (sendto(sock, buf, off, 0, (struct sockaddr *)&g.ring_to[i],
+			   sizeof(g.ring_to[i])) < 0 && errno != EAGAIN)
 		logmsg(LOG_WARNING, "ring sendto: %s", strerror(errno));
 }
 
@@ -854,7 +869,9 @@ static void usage(const char *argv0)
 "  -m, --min-range M        ignore returns closer than this (default 0.3)\n"
 "  -M, --max-range M        ignore returns further than this (default 200)\n"
 "  -r, --relay HOST[:PORT]  forward every raw packet here (default port 7502)\n"
-"  -o, --ring HOST[:PORT]   send the derived ring here (default port 7602)\n"
+"  -o, --ring HOST[:PORT]   send the derived ring here (default port 7602).\n"
+"                           Repeatable: the on-router mapper and an operator\n"
+"                           screen can both have it.\n"
 "  -z, --zone SPEC          polar zone, repeatable. SPEC is\n"
 "                           az_start:az_end:range[:confirm[:clear_after[:hyst]]]\n"
 "                           degrees:degrees:metres, then how many columns must\n"
@@ -952,11 +969,16 @@ int main(int argc, char **argv)
 			g.have_relay = true;
 			break;
 		case 'o':
-			if (!parse_hostport(optarg, &g.ring_to, 7602)) {
+			if (g.nring >= MAX_RING_DEST) {
+				fprintf(stderr, "at most %d ring destinations\n",
+					MAX_RING_DEST);
+				return 2;
+			}
+			if (!parse_hostport(optarg, &g.ring_to[g.nring], 7602)) {
 				fprintf(stderr, "bad --ring '%s'\n", optarg);
 				return 1;
 			}
-			g.have_ring = true;
+			g.nring++;
 			break;
 		case 'z':
 			if (!parse_zone(optarg)) {
