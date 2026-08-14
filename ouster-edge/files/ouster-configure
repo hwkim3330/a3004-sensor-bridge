@@ -1,0 +1,128 @@
+#!/bin/sh
+# ouster-configure - make the sensor be what this router expects, and say which
+# channels are the horizontal ones.
+#
+# The sensor's stored configuration is not something to rely on. This one came
+# back from a cable change with a 90 degree azimuth_window, and the result was a
+# ring that was empty, a mapper that matched nothing, and not one message saying
+# why: ouster-edge counted the absent columns as loss, slam2d saw too few
+# returns to match, and every daemon reported healthy statistics about nothing.
+# Asserting the configuration at start costs one HTTP request and removes that
+# whole failure.
+#
+#   ouster-configure <sensor-ip> [--apply]
+#
+# Without --apply it only reports, which is the safe thing to run by hand.
+# With it, anything that differs from the wanted value is written.
+#
+# It also picks the channel band. A 64-beam sensor spans about 35 degrees of
+# elevation, and ouster-edge reduces a whole band to one minimum range per
+# azimuth - so with the default band of every beam, a sensor on a vehicle
+# reports the floor in every direction. The horizontal rows are not at a fixed
+# index; they have to be read from beam_altitude_angles, which is what this
+# does.
+
+HOST="$1"
+[ -n "$HOST" ] || { echo "usage: ouster-configure <sensor-ip> [--apply]" >&2; exit 2; }
+APPLY=""
+[ "$2" = "--apply" ] && APPLY=1
+
+TMP="/tmp/ouster-configure.$$"
+trap 'rm -f "$TMP" "$TMP".b' EXIT
+
+get_cfg() {
+	curl -s -m 8 "http://$HOST/api/v1/sensor/config" > "$TMP" 2>/dev/null || return 1
+	[ -s "$TMP" ]
+}
+
+field() {
+	jsonfilter -i "$TMP" -e "\$.$1" 2>/dev/null
+}
+
+uci_get() {
+	uci -q get "ouster-edge.lidar.$1" 2>/dev/null
+}
+
+get_cfg || { echo "cannot reach $HOST" >&2; exit 1; }
+
+CUR_AZ_START="$(field azimuth_window[0])"
+CUR_AZ_END="$(field azimuth_window[1])"
+CUR_MODE="$(field lidar_mode)"
+CUR_DEST="$(field udp_dest)"
+
+# What this router wants. Empty means "leave it alone", so a site that
+# deliberately restricts the sensor is not fought with every boot.
+WANT_AZ="$(uci_get want_azimuth_window)"
+WANT_MODE="$(uci_get want_lidar_mode)"
+WANT_DEST="$(uci_get want_udp_dest)"
+
+echo "sensor $HOST: azimuth_window ${CUR_AZ_START}:${CUR_AZ_END}, mode ${CUR_MODE}, udp_dest ${CUR_DEST}"
+
+BODY=""
+add() { BODY="${BODY:+$BODY,}$1"; }
+
+if [ -n "$WANT_AZ" ]; then
+	W_START="${WANT_AZ%%:*}"
+	W_END="${WANT_AZ##*:}"
+	if [ "$W_START" != "$CUR_AZ_START" ] || [ "$W_END" != "$CUR_AZ_END" ]; then
+		echo "  azimuth_window ${CUR_AZ_START}:${CUR_AZ_END} -> ${W_START}:${W_END}"
+		add "\"azimuth_window\":[$W_START,$W_END]"
+	fi
+fi
+if [ -n "$WANT_MODE" ] && [ "$WANT_MODE" != "$CUR_MODE" ]; then
+	echo "  lidar_mode ${CUR_MODE} -> ${WANT_MODE}"
+	add "\"lidar_mode\":\"$WANT_MODE\""
+fi
+if [ -n "$WANT_DEST" ] && [ "$WANT_DEST" != "$CUR_DEST" ]; then
+	echo "  udp_dest ${CUR_DEST} -> ${WANT_DEST}"
+	add "\"udp_dest\":\"$WANT_DEST\""
+fi
+
+if [ -n "$BODY" ]; then
+	if [ -n "$APPLY" ]; then
+		curl -s -m 10 -X POST -H 'Content-Type: application/json' \
+			-d "{$BODY}" "http://$HOST/api/v1/sensor/config" >/dev/null
+		# The sensor reinitialises, which takes a few seconds and drops the
+		# stream while it does. Waiting here means whatever starts next sees
+		# a sensor that is already right.
+		i=0
+		while [ $i -lt 15 ]; do
+			sleep 2
+			get_cfg && [ "$(field lidar_mode)" = "${WANT_MODE:-$CUR_MODE}" ] && break
+			i=$((i + 1))
+		done
+		echo "  applied; now azimuth_window $(field azimuth_window[0]):$(field azimuth_window[1]), mode $(field lidar_mode)"
+	else
+		echo "  (not applied; pass --apply)"
+	fi
+else
+	echo "  nothing to change"
+fi
+
+# --- which rows are horizontal -------------------------------------------
+#
+# beam_altitude_angles is one angle per channel, and they are neither evenly
+# spaced nor centred on the array's middle. Reading them is the only way to know
+# which rows look straight ahead.
+if curl -s -m 8 "http://$HOST/api/v1/sensor/metadata/beam_intrinsics" > "$TMP".b 2>/dev/null; then
+	# jsonfilter prints one element per line, which is the only reason this
+	# does not need a JSON parser in awk. An earlier attempt split the whole
+	# document on brackets and commas and silently mixed the altitude angles
+	# with the azimuth ones - it found nothing, which was luckier than finding
+	# the wrong thing.
+	BAND="$(jsonfilter -i "$TMP".b -e '@.beam_altitude_angles[*]' 2>/dev/null | awk '
+		BEGIN { lo = -1; hi = -1 }
+		{
+			a = $1 + 0
+			if (a < 0) a = -a
+			if (a <= 1.5) { if (lo < 0) lo = NR - 1; hi = NR - 1 }
+		}
+		END { if (lo >= 0) printf "%d:%d", lo, hi }
+	')"
+	if [ -n "$BAND" ]; then
+		echo "OUSTER_CHANNEL_BAND=$BAND"
+		echo "  channels within 1.5 degrees of horizontal: $BAND" >&2
+	else
+		echo "  could not read beam_altitude_angles; leave channel_band unset" >&2
+	fi
+fi

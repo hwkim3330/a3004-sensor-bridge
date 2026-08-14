@@ -46,6 +46,31 @@ start_service() {
 	config_get status_interval lidar status_interval 200
 	config_get action        lidar action
 
+	# Make the sensor what this router expects, before reading back what it
+	# says. Its configuration does not survive its own reboot, and a wrong one
+	# is silent - a 90 degree azimuth_window gave an empty ring, zero matches
+	# and healthy counters everywhere, with nothing anywhere saying why.
+	#
+	# The same pass reads beam_altitude_angles and reports which rows are
+	# horizontal, because the whole-array default makes the ring a picture of
+	# the floor as soon as the sensor is on a vehicle, and the right indices
+	# depend on the beam layout rather than being fixed.
+	if [ -n "$sensor_ip" ]; then
+		local cfgout
+		if cfgout="$(/usr/sbin/ouster-configure "$sensor_ip" --apply 2>&1)"; then
+			logger -t ouster-edge "$(echo "$cfgout" | grep -v '^OUSTER_' | tr '\n' ' ')"
+			local auto_band
+			auto_band="$(echo "$cfgout" | sed -n 's/^OUSTER_CHANNEL_BAND=//p')"
+			if [ -z "$channel_band" ] && [ -n "$auto_band" ]; then
+				channel_band="$auto_band"
+				logger -t ouster-edge \
+				  "channel_band unset; using the horizontal rows $channel_band"
+			fi
+		else
+			logger -t ouster-edge "could not configure sensor $sensor_ip"
+		fi
+	fi
+
 	# Prefer what the sensor reports over what is configured here - the
 	# lidar mode can be changed on the sensor without anyone updating UCI.
 	if [ -n "$sensor_ip" ]; then

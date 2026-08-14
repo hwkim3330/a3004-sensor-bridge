@@ -8,7 +8,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ouster-edge
 PKG_VERSION:=1.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=KETI
@@ -68,6 +68,7 @@ define Package/ouster-edge/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ouster-edge $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/ouster-metadata $(1)/usr/sbin/
+	$(INSTALL_BIN) ./files/ouster-configure $(1)/usr/sbin/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/ouster-edge.init $(1)/etc/init.d/ouster-edge
 	$(INSTALL_DIR) $(1)/etc/config
