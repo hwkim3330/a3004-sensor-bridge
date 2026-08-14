@@ -332,6 +332,25 @@ without a soft-float penalty because there is no float to penalise. That number
 is a prediction until the board is powered; what the emulator establishes is
 correctness, not speed.
 
+### What the camera actually costs
+
+Worth separating from SLAM, because the first measurement was misread.
+
+| | cpu | fps |
+|---|---|---|
+| no client, slowdown on | **0.7%** | 10 |
+| no client, slowdown off | 2.9% | 60 |
+| one client pulling 29 Mbit/s | **25.9%** | 60 |
+
+The cost is serving bytes, not capturing or encoding them. `encoder=HW` and
+`encoder=CPU` measure the same to a tenth of a percent and deliver frames of the
+same 172 kB, which proves ustreamer never re-encoded an MJPEG source either way -
+its own `--help` says as much. `workers` 1 and 2 are also identical.
+
+So the knob for camera load is how many bytes leave the router. The 28.2% seen
+while measuring SLAM alongside it was a client pulling a stream, not the camera
+being expensive.
+
 ### It runs there. Measured on the board.
 
 The image is flashed and the chain is live: sensor on a LAN port, ouster-edge,

@@ -26,16 +26,28 @@ set ustreamer.video0.enabled='1'
 set ustreamer.video0.device='/dev/video0'
 set ustreamer.video0.resolution='1280x720'
 set ustreamer.video0.format='MJPEG'
-# HW, not CPU. The comment above says the camera does the encoding and
-# ustreamer relays, and the setting said the opposite: CPU makes ustreamer
-# decode the camera's JPEG and re-encode it in software. Measured on the board
-# at 1280x720 and 21 fps that cost 28.2% of a CPU - about the same as the whole
-# of slam2d - to arrive at a picture the camera had already produced. HW means
-# pass the device's own JPEG through untouched.
+# HW rather than CPU, but not for the reason first given, and it changes nothing.
 #
-# Not yet verified: the camera is unpowered as this is written, so the expected
-# drop to near zero is a prediction. quality and workers have no effect in this
-# mode either, since nothing is being encoded here.
+# The claim here was that CPU makes ustreamer decode the camera's MJPEG and
+# re-encode it in software, and that this cost the 28.2% of a CPU measured with a
+# client attached. Both halves were wrong, and ustreamer's own --help said so:
+# "It does not re-encode MJPEG to MJPEG ... for sources that already output
+# MJPEG." Measured on the board with a client pulling, everything else fixed:
+#
+#   encoder=HW    25.9% of one cpu   624 frames   172 kB each   29.3 Mbit/s
+#   encoder=CPU   25.8% of one cpu   626 frames   172 kB each   29.4 Mbit/s
+#
+# Identical, and the frames are the same size, which is the proof that nothing
+# was being re-encoded either way.
+#
+# What the cost actually is: serving the bytes. With no client ustreamer runs at
+# 0.7% at 10 fps and 2.9% at 60. Attach one client pulling 29 Mbit/s and it is
+# 26%. So the knob that matters is how many bytes leave the router - resolution
+# and frame rate - and not the encoder. workers has no effect either: 1 and 2
+# measured the same.
+#
+# HW stays because it states the intent plainly for an MJPEG source. It is not a
+# fix for anything.
 set ustreamer.video0.encoder='HW'
 set ustreamer.video0.desired_fps='20'
 set ustreamer.video0.quality='80'
