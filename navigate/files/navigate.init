@@ -1,0 +1,50 @@
+#!/bin/sh /etc/rc.common
+
+START=94
+USE_PROCD=1
+
+start_service() {
+	local enabled tele rp cp msz res maxr rad arr lin yaw score stall rto
+
+	config_load navigate
+	config_get_bool enabled nav enabled 0
+	[ "$enabled" = 1 ] || {
+		logger -t navigate "disabled in /etc/config/navigate"
+		return 0
+	}
+
+	config_get rp    nav ring_port        7602
+	config_get cp    nav cmd_port         7604
+	config_get tele  nav tele
+	config_get msz   nav map_size_cm      4000
+	config_get res   nav resolution_cm    5
+	config_get maxr  nav max_range_cm     3000
+	config_get rad   nav robot_radius_cm  40
+	config_get arr   nav arrive_cm        25
+	config_get lin   nav max_linear_pct   35
+	config_get yaw   nav max_yaw_pct      50
+	config_get score nav min_score_pct    25
+	config_get stall nav stall_ms         8000
+	config_get rto   nav ring_timeout_ms  1000
+
+	[ -n "$tele" ] && logger -t navigate \
+		"ENABLED: commanding a vehicle through agx-cmd at $tele"
+	[ "$(uci -q get can-bridge.bus.allow_inject)" = "1" ] || \
+		logger -t navigate \
+		"note: can-bridge allow_inject is off, so nothing reaches the bus"
+
+	procd_open_instance
+	procd_set_param command /usr/sbin/navigate \
+		-p "$rp" -c "$cp" -m "$msz" -r "$res" -R "$maxr" \
+		-b "$rad" -g "$arr" -l "$lin" -y "$yaw" \
+		-s "$score" -k "$stall" -t "$rto"
+	[ -n "$tele" ] && procd_append_param command -T "$tele"
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "navigate" "ouster-edge" "agx-cmd"
+}

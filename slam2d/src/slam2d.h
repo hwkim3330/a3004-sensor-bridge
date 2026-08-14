@@ -87,6 +87,14 @@ struct s2_match_result {
 int16_t s2_sin(int32_t a);
 int16_t s2_cos(int32_t a);
 
+/* Angle of the vector (x, y), in the same 1/4096 units. CORDIC in vectoring
+ * mode, which is the same rotation loop run to drive y to zero instead of the
+ * angle - so it costs what a sine costs and needs no atan2 from libm. */
+int32_t s2_atan2(int32_t y, int32_t x);
+
+/* Shortest signed difference a - b, in (-S2_TURN/2, S2_TURN/2]. */
+int32_t s2_angle_diff(int32_t a, int32_t b);
+
 bool s2_map_init(struct s2_map *m, int32_t width_cm, int32_t height_cm,
 		 int32_t res_cm);
 void s2_map_free(struct s2_map *m);

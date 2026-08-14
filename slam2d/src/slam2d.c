@@ -90,6 +90,73 @@ int16_t s2_cos(int32_t a)
 	return s2_sin(a + QUARTER);
 }
 
+int32_t s2_atan2(int32_t y, int32_t x)
+{
+	static const int32_t atan_tab[16] = {
+		131072,   77376,   40884,   20753,
+		 10417,    5213,    2607,    1304,
+		   652,     326,     163,      81,
+		    41,      20,      10,       5,
+	};
+	int32_t z = 0;
+	int i, quad = 0;
+
+	if (!x && !y)
+		return 0;
+
+	/* Fold into the right half plane, where the loop converges, and add the
+	 * half turn back afterwards. */
+	if (x < 0) {
+		x = -x;
+		y = -y;
+		quad = S2_TURN / 2;
+	}
+
+	/*
+	 * Normalise the magnitude, in both directions.
+	 *
+	 * Down, because the rotations grow it by about 1.647 and a scan point in
+	 * centimetres is already tens of thousands. Up, because a short vector
+	 * carries few significant bits and the shifts in the loop throw them
+	 * away: without this, the worst error was 0.75 degrees, eight times the
+	 * 0.088 degree resolution of the angle unit itself.
+	 */
+	while (x > (1 << 20) || y > (1 << 20) || y < -(1 << 20)) {
+		x >>= 1;
+		y >>= 1;
+	}
+	while (x < (1 << 18) && y < (1 << 18) && y > -(1 << 18)) {
+		x <<= 1;
+		y <<= 1;
+	}
+
+	for (i = 0; i < 16; i++) {
+		int32_t xn, yn;
+
+		if (y > 0) {
+			xn = x + (y >> i);
+			yn = y - (x >> i);
+			z += atan_tab[i];
+		} else {
+			xn = x - (y >> i);
+			yn = y + (x >> i);
+			z -= atan_tab[i];
+		}
+		x = xn;
+		y = yn;
+	}
+	/* Round rather than truncate on the way back to whole angle units. */
+	z = z >= 0 ? (z + SUB / 2) / SUB : -((-z + SUB / 2) / SUB);
+	return (z + quad) & S2_ANG_MASK;
+}
+
+int32_t s2_angle_diff(int32_t a, int32_t b)
+{
+	int32_t d = (a - b) & S2_ANG_MASK;
+
+	return d > S2_TURN / 2 ? d - S2_TURN : d;
+}
+
 /* ------------------------------------------------------------------- map */
 
 bool s2_map_init(struct s2_map *m, int32_t width_cm, int32_t height_cm,
@@ -279,24 +346,44 @@ void s2_map_build_pyramid(struct s2_map *m)
  * costs an add and a table lookup per point, with no multiplies at all.
  */
 struct rotated {
-	int32_t *dx;
+	int32_t *dx;		/* centimetres from the sensor */
 	int32_t *dy;
+	int32_t *qx;		/* the same points as cell indices */
+	int32_t *qy;
 	int n;
 };
 
-static int32_t score_at(const struct s2_map *m, int lvl, const struct rotated *r,
-			int32_t x_cm, int32_t y_cm)
+/* Floor division. C truncates towards zero, which puts the half-cell either
+ * side of the map origin into the same cell and makes the identity below false
+ * for negative coordinates. */
+static inline int32_t fdiv(int32_t a, int32_t b)
 {
-	int32_t res = m->res_cm << lvl;
-	int32_t ox = m->origin_x_cm, oy = m->origin_y_cm;
+	return a >= 0 ? a / b : -(((-a) + b - 1) / b);
+}
+
+/*
+ * Score a candidate whose cell coordinates are already known.
+ *
+ * The division that used to be here - two per point per candidate - is gone,
+ * and that is the whole optimisation. The search steps translation by exactly
+ * one cell of the current level, and floor((base + k*res) / res) is
+ * floor(base/res) + k exactly, so the quotient can be computed once per
+ * rotation and the inner loop reduced to an add, a bounds test and a lookup.
+ * Integer division is microcoded on a 1004Kc; multiplying it by 360 points and
+ * a few hundred candidates was most of the matcher.
+ */
+static int32_t score_cells(const struct s2_map *m, int lvl,
+			   const int32_t *qx, const int32_t *qy, int n,
+			   int32_t kx, int32_t ky)
+{
 	int32_t w = m->w[lvl], h = m->h[lvl];
 	const uint8_t *cell = m->cell[lvl];
 	int32_t sum = 0;
 	int i;
 
-	for (i = 0; i < r->n; i++) {
-		int32_t cx = (x_cm + r->dx[i] - ox) / res;
-		int32_t cy = (y_cm + r->dy[i] - oy) / res;
+	for (i = 0; i < n; i++) {
+		int32_t cx = qx[i] + kx;
+		int32_t cy = qy[i] + ky;
 		int32_t v;
 
 		if (cx < 0 || cy < 0 || cx >= w || cy >= h)
@@ -353,9 +440,10 @@ bool s2_match(struct s2_map *m, const struct s2_pose *seed,
 
 	rot.dx = malloc(sizeof(int32_t) * (size_t)sectors);
 	rot.dy = malloc(sizeof(int32_t) * (size_t)sectors);
-	if (!rot.dx || !rot.dy) {
-		free(rot.dx);
-		free(rot.dy);
+	rot.qx = malloc(sizeof(int32_t) * (size_t)sectors);
+	rot.qy = malloc(sizeof(int32_t) * (size_t)sectors);
+	if (!rot.dx || !rot.dy || !rot.qx || !rot.qy) {
+		free(rot.dx); free(rot.dy); free(rot.qx); free(rot.qy);
 		return false;
 	}
 
@@ -392,18 +480,31 @@ bool s2_match(struct s2_map *m, const struct s2_pose *seed,
 
 		best_score = -1;
 		for (da = -a_span; da <= a_span; da += a_step) {
-			int32_t dx, dy;
+			int32_t kx, ky, cells = span / step;
+			int i;
 
 			rotate_scan(&rot, ranges_cm, sectors, max_range_cm,
 				    centre.a + da);
 			if (!rot.n)
 				continue;
 			ok = true;
-			for (dy = -span; dy <= span; dy += step) {
-				for (dx = -span; dx <= span; dx += step) {
-					int32_t s = score_at(m, lvl, &rot,
-							     centre.x_cm + dx,
-							     centre.y_cm + dy);
+
+			/* Cell coordinates of every scan point at the search
+			 * centre, computed once. The translation search then
+			 * moves in whole cells and needs no division at all. */
+			for (i = 0; i < rot.n; i++) {
+				rot.qx[i] = fdiv(centre.x_cm + rot.dx[i] -
+						 m->origin_x_cm, step);
+				rot.qy[i] = fdiv(centre.y_cm + rot.dy[i] -
+						 m->origin_y_cm, step);
+			}
+
+			for (ky = -cells; ky <= cells; ky++) {
+				for (kx = -cells; kx <= cells; kx++) {
+					int32_t s = score_cells(m, lvl, rot.qx,
+								rot.qy, rot.n,
+								kx, ky);
+					int32_t dx = kx * step, dy = ky * step;
 
 					tried++;
 					if (s > best_score) {
@@ -435,6 +536,8 @@ bool s2_match(struct s2_map *m, const struct s2_pose *seed,
 
 	free(rot.dx);
 	free(rot.dy);
+	free(rot.qx);
+	free(rot.qy);
 	return ok;
 }
 
