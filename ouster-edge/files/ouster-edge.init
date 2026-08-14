@@ -57,7 +57,18 @@ start_service() {
 	# depend on the beam layout rather than being fixed.
 	if [ -n "$sensor_ip" ]; then
 		local cfgout auto_band
-		if cfgout="$(/usr/sbin/ouster-configure "$sensor_ip" --apply 2>&1)"; then
+		#
+		# Bounded, though not for the reason it looks like.
+		#
+		# A restart with no sensor attached took minutes, and the guess was
+		# that an unanswered ARP on the router's own LAN was stalling the HTTP
+		# attempt. Measured, one probe of an absent 192.168.1.50 returns in
+		# 3.2 s ("Failed to send request: Operation not permitted"), so that
+		# was wrong and the delay is elsewhere. The cap stays because a start
+		# path that reaches out to hardware should have a bound on it either
+		# way, and 8 s is generous for a sensor that is present; the
+		# sensor-arrives-late case is handled by the background wait below.
+		if cfgout="$(timeout 8 /usr/sbin/ouster-configure "$sensor_ip" --apply 2>&1)"; then
 			logger -t ouster-edge "$(echo "$cfgout" | grep -v '^OUSTER_' | tr '\n' ' ')"
 			auto_band="$(echo "$cfgout" | sed -n 's/^OUSTER_CHANNEL_BAND=//p')"
 			if [ -z "$channel_band" ] && [ -n "$auto_band" ]; then
@@ -112,7 +123,8 @@ start_service() {
 		# reachable at all. That is a lie at exactly the moment someone
 		# is trying to find out whether the sensor is talking.
 		local meta
-		if meta="$(/usr/sbin/ouster-metadata "$sensor_ip" 2>/dev/null)" &&
+		# Bounded for the same reason as the probe above.
+		if meta="$(timeout 8 /usr/sbin/ouster-metadata "$sensor_ip" 2>/dev/null)" &&
 		   [ -n "$meta" ]; then
 			eval "$meta"
 			channels="${OUSTER_CHANNELS:-$channels}"

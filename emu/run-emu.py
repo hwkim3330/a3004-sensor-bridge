@@ -41,7 +41,7 @@ TREE = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 # Guest port -> host port. QEMU user-mode networking forwards both TCP and UDP,
 # which is what lets the lidar feed be injected from outside.
 FWD_TCP = {80: 8180, 8080: 8280, 8082: 8282, 8083: 8283, 7603: 8303}
-FWD_UDP = {7502: 8502, 7721: 8721, 7701: 8701, 7814: 8814}
+FWD_UDP = {7502: 8502, 7721: 8721, 7701: 8701, 7814: 8814, 7788: 8788}
 
 # OpenWrt's br-lan is statically 192.168.1.1 and never asks for DHCP, so QEMU's
 # user network is pointed at the same subnet and forwards are addressed to that
@@ -131,6 +131,12 @@ class Emu:
                 return False
             r, _, _ = select.select([self.proc.stdout], [], [], 0.5)
             if r:
+                # One raw read. stdout is opened unbuffered, so this is a
+                # single os.read that returns whatever is available - it does
+                # not wait for 4096 bytes. (It was briefly changed to read1()
+                # on the theory that a buffered read was stalling the harness;
+                # FileIO has no read1(), which is also why the theory was
+                # wrong.)
                 chunk = self.proc.stdout.read(4096)
                 if not chunk:
                     break
@@ -188,22 +194,111 @@ class Emu:
         `(7*11))` survives any filter keyed on `$((`. Framing removes the
         guesswork: everything between the two output markers is the answer, and
         anything else is noise by construction.
+
+        The markers also carry a per-command number, which is not decoration.
+        Without it, one command that runs longer than its timeout shifts every
+        later result by one: an `ouster-edge restart` that took over 40 s turned
+        into six failures elsewhere, two of them reporting packages "not in this
+        image" that were sitting in the rootfs. Numbered markers mean a late
+        answer is recognised as belonging to an earlier command and skipped,
+        so a slow step costs its own result and nothing else.
         """
         # A newline here would break the framing and, with a heredoc, leave the
         # shell waiting for a terminator - which wedged every command after it.
         assert "\n" not in line, "cmd() takes a single line"
+        self.seq = getattr(self, "seq", 0) + 1
+        n = self.seq
         self.buf = b""
-        send = f"echo $((3*5))BEGIN; {line}; echo $((7*11))END\n"
+        send = (f"echo $((3*5))BEGIN{n}; {line}; echo $((7*11))END{n}\n")
         self.proc.stdin.write(send.encode())
         self.proc.stdin.flush()
-        if not self.read_until(re.compile(rb"77END"), timeout):
+        end = re.compile(rb"77END%d\b" % n)
+        if not self.read_until(end, timeout):
+            # Nothing usable, and the guest may still be working. Leave a note
+            # rather than returning a value that reads as an answer.
+            print(f"  INFO  command {n} did not finish within {timeout}s: "
+                  f"{line[:60]}")
+            # Then resynchronise before returning.
+            #
+            # A restart of ouster-edge leaves this console quiet for around two
+            # minutes for reasons not yet established. Numbered markers stop that
+            # from being attributed to the wrong command, but without this the
+            # next few commands time out in turn and a whole section of the run
+            # is lost to one slow step. This waits for the late answer to arrive
+            # and for a fresh marker of its own, so the caller after it sees a
+            # working console.
+            self.read_until(end, 150)
+            for _ in range(3):
+                self.seq += 1
+                m = self.seq
+                self.buf = b""
+                self.proc.stdin.write(f"echo $((7*11))END{m}\n".encode())
+                self.proc.stdin.flush()
+                if self.read_until(re.compile(rb"77END%d\b" % m), 60):
+                    print(f"  INFO  console resynchronised at marker {m}")
+                    break
             return None
         out = self.buf.decode("utf-8", "replace")
-        if "15BEGIN" not in out:
+        begin = f"15BEGIN{n}"
+        if begin not in out:
             return None
-        body = out.split("15BEGIN", 1)[1].split("77END", 1)[0]
+        # Split on the *last* occurrence of this command's BEGIN: the echoed
+        # command line contains the marker's command form, and on a wrapped line
+        # that echo can be split in a way that still matches.
+        body = out.rsplit(begin, 1)[1].split(f"77END{n}", 1)[0]
         return "\n".join(l.strip() for l in body.splitlines()
                           if l.strip()).strip()
+
+    def pid_of(self, name):
+        """The pid of a daemon, by exact name.
+
+        Exact comm, not a pattern: a pattern matches the shell running the
+        search, and busybox truncates comm at 15 characters so a long daemon
+        name never matches `pgrep -x` either. This asks the kernel instead.
+        """
+        out = self.cmd(
+            "for p in /proc/[0-9]*; do "
+            f"[ \"$(cat $p/comm 2>/dev/null)\" = \"{name[:15]}\" ] && "
+            "{ echo ${p#/proc/}; break; }; done; true", timeout=30)
+        for tok in (out or "").split():
+            if tok.isdigit():
+                return tok
+        return None
+
+    def service(self, name, action="restart", timeout=90):
+        """Restart a service without holding the console while it happens.
+
+        Run in the foreground, `/etc/init.d/ouster-edge restart` left the console
+        silent for over two minutes - and because a timeout there shifts every
+        later result, one slow restart produced a page of unrelated failures.
+        The service itself is not slow: its own log shows six seconds from the
+        first line to "listening on :7502". Why the console stays quiet for that
+        long is still not established - a buffered-read stall in read_until()
+        was checked and ruled out - so the restart runs in the foreground with a
+        generous timeout, which is what a person types and what demonstrably
+        takes effect. Detaching it looked tidier and did not restart the service
+        at all. The numbered markers in cmd() are what keep a slow restart from
+        costing anything but its own result.
+
+        What is polled is a *new* pid, not merely a running one. Waiting for "a
+        process by that name" returned instantly - the old instance was still
+        alive - so the caller carried on with configuration that had not been
+        applied yet, and the ring went to the previous port. That produced
+        rings=0 and read as a broken mapper rather than a race in this harness.
+        """
+        old = self.pid_of(name) if action == "restart" else None
+        self.cmd(f"/etc/init.d/{name} {action}", timeout=timeout)
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            now = self.pid_of(name)
+            if now and now != old:
+                # Running under a new pid; give it a moment to finish binding.
+                time.sleep(1.5)
+                return True
+            time.sleep(2)
+        print(f"  INFO  {name} did not restart within {timeout}s "
+              f"(pid stayed {old})")
+        return False
 
     def stop(self):
         try:
@@ -332,6 +427,18 @@ def http(port, path="/", timeout=4):
             return r.status, r.read()
     except Exception as e:
         return None, str(e).encode()
+
+
+def _json_or_empty(raw):
+    """Guest JSON, or {} - a truncated read should fail one check rather than
+    end the run with a traceback."""
+    if not raw:
+        return {}
+    import json as _json
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return {}
 
 
 def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
@@ -470,9 +577,22 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
             for tok in (out or "").replace("\n", " ").split():
                 if tok.startswith("PID=") and tok[4:].isdigit():
                     s2pid = tok[4:]
+            # 90 s, not 40. Starting this service calls ouster-configure,
+            # which tries to reach a sensor that does not exist here and waits
+            # out its HTTP timeout before giving up - on emulated mipsel that
+            # put the whole restart past 40 s and cost the slam2d results.
+            # How long an absent sensor costs. Reported rather than only
+            # tolerated: this is the slowest step in the run, and it is the same
+            # delay a real boot pays when the lidar is not powered.
+            probe = emu.cmd("time uclient-fetch -q -T 6 -O /tmp/probe "
+                            "http://192.168.1.50/api/v1/sensor/config 2>&1 "
+                            "| tr '\\n' ' '", timeout=120)
+            print(f"  INFO  one HTTP probe of an absent sensor: {probe}")
             emu.cmd("uci set ouster-edge.lidar.ring='127.0.0.1:7802'; "
-                    "uci commit ouster-edge; /etc/init.d/ouster-edge restart",
-                    timeout=40)
+                    "uci commit ouster-edge", timeout=60)
+            t0_ = time.time()
+            emu.service("ouster-edge")
+            print(f"  INFO  ouster-edge restarted in {time.time() - t0_:.0f}s")
             time.sleep(2)
             feed_lidar(FWD_UDP[7502], seconds=4.0)
             time.sleep(1.5)
@@ -516,8 +636,8 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
                 if tok.startswith("PID=") and tok[4:].isdigit():
                     npid = tok[4:]
             emu.cmd("uci set ouster-edge.lidar.ring='127.0.0.1:7812'; "
-                    "uci commit ouster-edge; /etc/init.d/ouster-edge restart",
-                    timeout=40)
+                    "uci commit ouster-edge", timeout=60)
+            emu.service("ouster-edge")
             time.sleep(2)
             feed_lidar(FWD_UDP[7502], seconds=4.0)
             time.sleep(1.5)
@@ -596,15 +716,15 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
             # covered by the host tests against a real vcan pair instead.
             emu.cmd("uci set can-bridge.bus.enabled=1")
             emu.cmd("uci set can-bridge.bus.interface=vcan0")
-            emu.cmd("uci set can-bridge.bus.track=211,251")
+            # 130 and 151 are here for the protocol-v1 checks further down: the
+            # v1 command id so the frame agx-cmd produces can be read back out
+            # of the status file, and the v1 discriminator.
+            emu.cmd("uci set can-bridge.bus.track=211,251,130,151")
             emu.cmd("uci set can-bridge.bus.allow_inject=1")
             emu.cmd("uci set can-bridge.bus.listen=7701")
             emu.cmd("uci commit can-bridge")
-            emu.cmd("/etc/init.d/can-bridge restart", timeout=40)
-            time.sleep(2)
-            running = emu.cmd("pgrep -x can-bridge >/dev/null && echo yes || echo no")
-            check("can-bridge started on vcan0",
-                  running and running.strip() == "yes", f"got {running!r}")
+            up = emu.service("can-bridge")
+            check("can-bridge started on vcan0", up, "did not come up")
 
             tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             pkt = b"BCAN" + bytes([1, 1, 0, 0]) + \
@@ -647,8 +767,13 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
             # 0x211 above is not a generation marker, so the daemon must still
             # say "unknown" - it must not default to the generation its own
             # decoder implements.
+            # Compared, not passed as the detail argument. Written the other
+            # way round first - check(name, value, "unknown") - which made the
+            # non-empty string the truth value, so this passed whatever the
+            # daemon answered, including the "guessed v2" it exists to catch.
             check("protocol not guessed from 0x211",
-                  snap.get("agilex_protocol"), "unknown")
+                  snap.get("agilex_protocol") == "unknown",
+                  f"got {snap.get('agilex_protocol')!r}")
 
             # Now make it hear a real v2 marker. It cannot be the running
             # daemon's own injection: a raw CAN socket does not receive what it
@@ -684,9 +809,141 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
                 except Exception:
                     snap2 = {}
             check("0x241 detected as protocol v2 on mipsel",
-                  snap2.get("agilex_protocol"), "v2")
+                  snap2.get("agilex_protocol") == "v2",
+                  f"got {snap2.get('agilex_protocol')!r}")
             said = emu.cmd("logread | grep -i 'protocol v' | tail -1")
             print(f"  INFO  the daemon logged: {said or '(nothing)'}")
+
+            # A v1 marker into a daemon that has already heard a v2 one is the
+            # vendor's UNKNOWN case, and the answer must go back to unknown
+            # rather than stay on the first one it saw. Getting this wrong is
+            # not academic: it would let a bus with both markers command a
+            # generation, which is the one situation where neither answer is
+            # safe.
+            tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            v1mark = b"BCAN" + bytes([1, 1, 0, 0]) + \
+                struct.pack("<IB3x8s", 0x151, 8, bytes(8))
+            for _ in range(6):
+                tx.sendto(v1mark, ("127.0.0.1", FWD_UDP[7721]))
+                time.sleep(0.1)
+            tx.close()
+            time.sleep(2.0)
+            snap3 = _json_or_empty(emu.cmd(
+                "cat /var/run/can-bridge.json 2>/dev/null | tr -d '\\n\\t'"))
+            check("both markers go back to unknown, not the first one seen",
+                  snap3.get("agilex_protocol") == "unknown",
+                  f"got {snap3.get('agilex_protocol')!r}")
+            conflict = emu.cmd("logread | grep -c 'both AgileX protocol markers'")
+            check("and the conflict is logged",
+                  (conflict or "0").strip() not in ("", "0"),
+                  f"got {conflict!r}")
+
+            # Restart the service instance so its detection starts clean, then
+            # let it hear only the v1 marker.
+            emu.service("can-bridge")
+            time.sleep(2.5)
+            tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            for _ in range(6):
+                tx.sendto(v1mark, ("127.0.0.1", FWD_UDP[7721]))
+                time.sleep(0.1)
+            tx.close()
+            time.sleep(2.0)
+            snap4 = _json_or_empty(emu.cmd(
+                "cat /var/run/can-bridge.json 2>/dev/null | tr -d '\\n\\t'"))
+            check("0x151 alone detected as protocol v1 on mipsel",
+                  snap4.get("agilex_protocol") == "v1",
+                  f"got {snap4.get('agilex_protocol')!r}")
+
+            # --- the v1 command path, on the target ---
+            #
+            # Worth doing here rather than trusting the host tests, because the
+            # one thing that differs is arithmetic: mipsel is soft-float, and a
+            # v1 command is a division and a rounding rather than v2's scaling
+            # of an integer. This runs the whole chain on the guest -
+            #
+            #   TELE -> agx-cmd -> BCAN -> can-bridge #2 -> vcan0 -> the service
+            #   instance, which reports frame 130 in its status file
+            #
+            # - and reads the actual bytes back out. The service instance sees
+            # the frame because it is a different socket from the one that sent
+            # it, which is the same property that keeps rx at 0 above.
+            #
+            # agx-cmd is left on its default --protocol auto and default
+            # --bridge-status, so what is being tested is the real wiring: the
+            # generation the service instance just published is the one the
+            # commander picks up.
+            out3 = emu.cmd("agx-cmd -f --listen 7788 --inject 127.0.0.1:7721 "
+                           "--max-linear 0.5 --rate 20 --accel 5 "
+                           "-S /tmp/agx.json >/tmp/agx.log 2>&1 & echo PID=$!")
+            pid3 = None
+            for tok in (out3 or "").replace("\n", " ").split():
+                if tok.startswith("PID=") and tok[4:].isdigit():
+                    pid3 = tok[4:]
+            time.sleep(1.5)
+
+            tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            held = {}
+            for i in range(60):
+                t = bytearray(32)
+                t[0:4] = b"TELE"
+                t[4] = 1
+                t[5] = 1				# armed
+                struct.pack_into("<I", t, 8, i + 1)
+                struct.pack_into("<h", t, 22, 10000)	# full stick forward
+                tx.sendto(bytes(t), ("127.0.0.1", FWD_UDP[7788]))
+                time.sleep(0.05)
+                # Snapshot mid-drive, while the stick is still held.
+                #
+                # The tracked frame in the status file is the newest one, and
+                # agx-cmd deliberately ends with zeros - on the deadman and
+                # again at exit. Reading after the feed therefore captured
+                # `linear = 0`, which is correct behaviour being measured at the
+                # wrong moment: it read as the percentage arithmetic being
+                # broken. So the frame that matters is taken here.
+                if i == 45:
+                    held = _json_or_empty(emu.cmd(
+                        "cat /var/run/can-bridge.json 2>/dev/null "
+                        "| tr -d '\\n\\t'", timeout=30))
+            tx.close()
+            time.sleep(2.0)
+
+            agx = _json_or_empty(emu.cmd(
+                "cat /tmp/agx.json 2>/dev/null | tr -d '\\n\\t'"))
+            check("agx-cmd took the generation from can-bridge on mipsel",
+                  agx.get("protocol") == "v1", f"got {agx.get('protocol')!r}")
+            check("and it commanded rather than withholding",
+                  agx.get("sent", 0) > 0 and agx.get("protocol_skips", 1) >= 0,
+                  f"sent={agx.get('sent')} skips={agx.get('protocol_skips')}")
+
+            snap5 = _json_or_empty(emu.cmd(
+                "cat /var/run/can-bridge.json 2>/dev/null | tr -d '\\n\\t'"))
+            # The mid-drive snapshot for the payload, the final one for presence.
+            f130 = (held.get("frames") or {}).get("130") \
+                or (snap5.get("frames") or {}).get("130")
+            check("a v1 command frame reached vcan0 through the bridge",
+                  bool(f130),
+                  f"frames={list((snap5.get('frames') or {}).keys())}")
+            if f130:
+                data = bytes.fromhex(f130.get("data", ""))
+                print(f"  INFO  0x130 on the bus: {f130.get('data')} "
+                      f"({f130.get('count')} frames)")
+                # Full stick is --max-linear 0.5, and v1 asks for a percentage
+                # of the vehicle's 3.0 m/s - so 17%, not 100%. This is the check
+                # that the divisor is the vehicle's maximum and not the
+                # daemon's own limit; dividing by the limit would read 100 here
+                # and drive at full speed on the first command.
+                check("the v1 percentage is of 3.0 m/s, not of --max-linear",
+                      len(data) >= 3 and
+                      struct.unpack("b", data[2:3])[0] == 17,
+                      f"got {struct.unpack('b', data[2:3])[0] if len(data) >= 3 else None}")
+                check("control mode is CAN", len(data) >= 1 and data[0] == 1,
+                      f"got {data[0] if data else None}")
+                if len(data) == 8:
+                    ck = ((0x130 & 0xFF) + (0x130 >> 8) + 8 + sum(data[:7])) & 0xFF
+                    check("the checksum computed on mipsel is right",
+                          data[7] == ck, f"got {data[7]:02X} want {ck:02X}")
+            if pid3:
+                emu.cmd(f"kill {pid3} 2>/dev/null; echo ok")
             # Only the second instance. Killing by name would take the service
             # one with it and leave the rest of the run in a different state
             # than it expects.

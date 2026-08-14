@@ -700,7 +700,17 @@ function canPoll() {
 			var html, f, stale;
 
 			el("canWrap").classList.remove("hidden");
+			/*
+			 * The protocol generation belongs next to the frame table,
+			 * because the table only means what it says if the decoder
+			 * matched the bus. "세대 미확인" is not a cosmetic state: it
+			 * is also the state in which agx-cmd refuses to command.
+			 */
+			var gen = c.agilex_protocol === "v1" ? "프로토콜 v1"
+				: c.agilex_protocol === "v2" ? "프로토콜 v2"
+				: "세대 미확인";
 			el("canLabel").textContent = c.interface + " · rx " + c.rx +
+				" · " + gen +
 				(c.inject_allowed ? " · INJECT ENABLED" : " · read-only");
 
 			if (!ids.length) {
@@ -710,7 +720,24 @@ function canPoll() {
 				return;
 			}
 
-			html = "<table><thead><tr><th>ID</th><th>DATA</th>" +
+			/*
+			 * Said on the page and not only in the log. Frames are arriving -
+			 * the table below proves it - and yet an armed stick will move
+			 * nothing, because agx-cmd withholds commands until the bus has
+			 * identified itself. Without this line that combination looks
+			 * like a broken commander rather than a working safeguard.
+			 */
+			html = "";
+			if (c.agilex_protocol !== "v1" && c.agilex_protocol !== "v2") {
+				html += "<div class=\"hint\">프로토콜 세대 미확인" +
+					(c.agilex_undecided ? " (프레임 " + c.agilex_undecided +
+					 "개 판단 보류)" : "") +
+					". v1 은 <code>0x151</code>, v2 는 <code>0x221</code>" +
+					"/<code>0x241</code> 로 갈립니다. 이 상태에서는 " +
+					"<code>agx-cmd</code> 가 명령을 보내지 않습니다.</div>";
+			}
+
+			html += "<table><thead><tr><th>ID</th><th>DATA</th>" +
 			       "<th>COUNT</th><th>AGE</th></tr></thead><tbody>";
 			ids.forEach(function (id) {
 				f = c.frames[id];
