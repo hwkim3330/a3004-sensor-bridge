@@ -1053,6 +1053,23 @@ int main(int argc, char **argv)
 	}
 	fcntl(txsock, F_SETFL, fcntl(txsock, F_GETFL, 0) | O_NONBLOCK);
 
+	/*
+	 * Allow a broadcast ring destination.
+	 *
+	 * The operator's tablet gets its address from the router's DHCP, so the
+	 * router cannot have it in a shipped default. Broadcasting the ring to the
+	 * LAN removes the question: anything on the access point that listens on
+	 * the port receives it, with nothing to configure at either end. The ring
+	 * is 1100 bytes at 10 Hz on a private network with no uplink, so the cost
+	 * of broadcasting it is not worth measuring.
+	 *
+	 * Without SO_BROADCAST, sendto to a broadcast address fails with EACCES
+	 * and the only symptom is a panel that never fills.
+	 */
+	opt = 1;
+	if (setsockopt(txsock, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt)) < 0)
+		logmsg(LOG_WARNING, "SO_BROADCAST: %s", strerror(errno));
+
 	bufs = malloc(sizeof(*bufs) * BATCH);
 	if (!bufs) {
 		logmsg(LOG_ERR, "out of memory");

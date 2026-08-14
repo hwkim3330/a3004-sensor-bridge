@@ -477,7 +477,8 @@ static void usage(const char *a0)
 	fprintf(stderr,
 "Usage: %s [options]\n"
 "  -p, --port PORT        HTTP port the browser posts to (default 8083)\n"
-"  -r, --remote HOST:PORT forward intent here (default port 7720)\n"
+"  -r, --remote HOST:PORT forward intent here as TELE (default 7722,\n"
+"                         which is agx-cmd)\n"
 "  -H, --rate HZ          forward cadence (default 20)\n"
 "  -c, --cmd-port PORT    also accept commands as UDP, for a native app\n"
 "  -t, --timeout MS       deadman: neutral and disarm after this long without\n"
@@ -532,7 +533,7 @@ int main(int argc, char **argv)
 		switch (opt) {
 		case 'p': g.port = atoi(optarg); break;
 		case 'r':
-			if (!parse_hostport(optarg, &g.peer, 7720)) {
+			if (!parse_hostport(optarg, &g.peer, 7722)) {
 				fprintf(stderr, "bad --remote '%s'\n", optarg);
 				return 1;
 			}

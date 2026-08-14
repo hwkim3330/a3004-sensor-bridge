@@ -848,7 +848,8 @@ static const char usage[] =
 "Usage: navigate [options]\n"
 "  -p, --ring-port PORT     ouster-edge rings arrive here (default 7602)\n"
 "  -c, --cmd-port PORT      'GOAL x_cm y_cm' / 'STOP' arrive here (default 7604)\n"
-"  -T, --tele HOST[:PORT]   send TELE frames to agx-cmd (default port 7721)\n"
+"  -T, --tele HOST[:PORT]   send TELE frames to agx-cmd (default 7722; 7721 is\n"
+"                           teleop, which speaks TCMD, not TELE)\n"
 "  -m, --map-size CM        square map edge (default 4000)\n"
 "  -r, --resolution CM      cell size (default 5)\n"
 "  -R, --max-range CM       ignore returns beyond this (default 3000)\n"
@@ -933,7 +934,7 @@ int main(int argc, char **argv)
 		case 'p': g.ring_port = atoi(optarg); break;
 		case 'c': g.cmd_port = atoi(optarg); break;
 		case 'T':
-			if (!parse_hostport(optarg, &g.tele_to, 7721)) {
+			if (!parse_hostport(optarg, &g.tele_to, 7722)) {
 				fprintf(stderr, "bad --tele %s\n", optarg);
 				return 2;
 			}
