@@ -332,6 +332,36 @@ without a soft-float penalty because there is no float to penalise. That number
 is a prediction until the board is powered; what the emulator establishes is
 correctness, not speed.
 
+### 3D on a laptop, through the router
+
+The relay works, and it is what makes "the router is a reflex node, 3D belongs
+elsewhere" a division of labour rather than a limitation.
+
+Measured with `ouster-edge.lidar.relay` pointed at a laptop while the router was
+also running its own 2D SLAM:
+
+| | |
+|---|---|
+| router | 6832 packets in, **6832 relayed**, `missed_columns` 0 |
+| laptop | **640 datagrams/s**, every one 12544 bytes - the full 1024x10 rate |
+| in four seconds | **890,787 returns**, 21.7 of 64 beams per column |
+| range | nearest 0.49 m, median 1.44 m, farthest 110 m |
+
+The sensor's `udp_dest` still points at the router throughout - it has no idea the
+laptop exists. That is the part worth keeping: the laptop does not need to be on
+the sensor's network, does not reconfigure it, and cannot take it away from the
+router by asking for the stream. Which also means several laptops can have it at
+once, and the sensor's configuration stays owned by one thing.
+
+So a 3D mapping mode on a laptop is a matter of pointing something at port 7502.
+KISS-ICP through `ouster.sdk` on this desktop costs 11.4 ms per scan at the full
+2048x10 rate, measured at the top of this file, so there is a great deal of room.
+
+One caveat with teeth: the relay is the raw stream, 126 Mbit/s at full rate. Over
+the wire that is nothing. Over the router's own WiFi it is most of the air, and
+it would be competing with the camera - the ring exists precisely so that the
+thing crossing WiFi is 88 kbit/s instead.
+
 ### What the camera actually costs
 
 Worth separating from SLAM, because the first measurement was misread.
