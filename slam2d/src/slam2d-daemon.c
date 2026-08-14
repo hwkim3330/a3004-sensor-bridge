@@ -64,7 +64,9 @@ static struct {
 	struct s2_pose pose, prev;
 	bool have_prev;
 
-	uint64_t rings, matched, skipped_short, skipped_bad;
+	uint64_t rings, matched, skipped_short, skipped_bad, duplicates;
+	uint16_t last_frame;
+	bool have_last_frame;
 	int32_t last_score, last_max_score;
 	uint32_t last_candidates;
 	uint32_t last_match_us;
@@ -131,6 +133,7 @@ static void status_write(void)
 		"\t\"matched\": %llu,\n"
 		"\t\"skipped_too_few_returns\": %llu,\n"
 		"\t\"skipped_malformed\": %llu,\n"
+		"\t\"duplicate_frames\": %llu,\n"
 		"\t\"score\": %d,\n"
 		"\t\"score_max\": %d,\n"
 		"\t\"score_frac_pct\": %d,\n"
@@ -146,6 +149,7 @@ static void status_write(void)
 		(unsigned long long)g.matched,
 		(unsigned long long)g.skipped_short,
 		(unsigned long long)g.skipped_bad,
+		(unsigned long long)g.duplicates,
 		(int)g.last_score, (int)g.last_max_score,
 		g.last_max_score ? (int)((int64_t)g.last_score * 100 /
 					 g.last_max_score) : 0,
@@ -195,6 +199,32 @@ static void handle_ring(const uint8_t *p, size_t len)
 	for (i = 0; i < sectors; i++)
 		ranges[i] = (uint16_t)(p[RING_HDR + 2 * i] |
 				       (p[RING_HDR + 2 * i + 1] << 8));
+
+
+	/*
+	 * The same revolution twice is a configuration mistake, not a sensor fault,
+	 * and it has to be survivable rather than merely avoided.
+	 *
+	 * A ring list containing both a broadcast address and 127.0.0.1 delivers
+	 * every frame twice, because a router receives its own broadcast. That
+	 * doubled the work and quietly damaged the match: two copies of one scan
+	 * have no motion between them, so the constant-velocity seed was flattened
+	 * every other frame and the search started from a worse guess than it had.
+	 *
+	 * frame_id is in the header for exactly this. Comparing against the previous
+	 * one only - not a set - keeps it to a single integer and still catches every
+	 * duplicate that arrives back to back, which is the shape this failure has.
+	 */
+	{
+		uint16_t fid = (uint16_t)(p[8] | (p[9] << 8));
+
+		if (g.have_last_frame && fid == g.last_frame) {
+			g.duplicates++;
+			return;
+		}
+		g.last_frame = fid;
+		g.have_last_frame = true;
+	}
 
 	/* A scan with almost nothing in it will match anywhere. Refusing it
 	 * keeps a bad pose out of the map, which is far more expensive to

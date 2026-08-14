@@ -156,7 +156,9 @@ static struct {
 	const char *fault;
 
 	uint32_t seq;
-	uint64_t rings, matched, tele_sent, replans;
+	uint64_t rings, matched, tele_sent, replans, duplicates;
+	uint16_t last_frame;
+	bool have_last_frame;
 	int32_t last_score_pct;
 	int32_t last_remaining_cm, best_remaining_cm;
 	uint64_t last_ring_ms, last_progress_ms;
@@ -671,6 +673,26 @@ static void handle_ring(const uint8_t *p, size_t len)
 	    len < (size_t)RING_HDR + 3u * sectors)
 		return;
 
+	/*
+	 * Refuse the same revolution twice.
+	 *
+	 * A ring list holding both a broadcast address and 127.0.0.1 delivers every
+	 * frame twice - a router receives its own broadcast - and two copies of one
+	 * scan have no motion between them, so the constant-velocity seed is
+	 * flattened and the planner is fed a pose that stopped moving. Cheaper to
+	 * be immune than to rely on the configuration being right.
+	 */
+	{
+		uint16_t fid = (uint16_t)(p[8] | (p[9] << 8));
+
+		if (g.have_last_frame && fid == g.last_frame) {
+			g.duplicates++;
+			return;
+		}
+		g.last_frame = fid;
+		g.have_last_frame = true;
+	}
+
 	/* The ring carries ouster-edge's own zone verdict at offset 10, so the
 	 * reflex layer needs no extra plumbing to be heard here. */
 	g.zone_alarm = p[10] != 0;
@@ -786,6 +808,7 @@ static void status_write(void)
 		"\t\"rings\": %llu,\n"
 		"\t\"matched\": %llu,\n"
 		"\t\"replans\": %llu,\n"
+		"\t\"duplicate_frames\": %llu,\n"
 		"\t\"tele_sent\": %llu,\n"
 		"\t\"commanding\": %s\n"
 		"}\n",
@@ -799,6 +822,7 @@ static void status_write(void)
 		g.zone_alarm ? "true" : "false",
 		(unsigned long long)g.rings, (unsigned long long)g.matched,
 		(unsigned long long)g.replans,
+		(unsigned long long)g.duplicates,
 		(unsigned long long)g.tele_sent,
 		(g.have_tele && !g.dry_run) ? "true" : "false");
 	fclose(fp);
