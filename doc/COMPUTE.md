@@ -281,20 +281,47 @@ without a soft-float penalty because there is no float to penalise. That number
 is a prediction until the board is powered; what the emulator establishes is
 correctness, not speed.
 
-So all three hosts are now open, and the choice is about where the map and the
-planner should live rather than about who can do the arithmetic:
+### The decision: on the router
 
-- **the router**, which already has the ring in memory and would not have to send
-  it anywhere
-- **the tablet**, which has an FPU and NEON going spare, is already receiving the
-  ring, and is already where a destination would be tapped
-- **a Xavier** with ROS 2, slam_toolbox and nav2, which is the conventional answer
-  and brings the JetPack 5 problem with it
+All three hosts became possible once the floating point was gone, so the choice
+stopped being about arithmetic. It is **the router**, for one reason that
+outweighs the rest and several that support it.
 
-Whichever it is, the robot needs only to execute velocity commands, which
+**Autonomy must not depend on the operator still being there.** The goal is to
+tap a destination and have the vehicle drive to it. If the map and the planner
+live on the tablet, then putting the tablet in a pocket, walking behind a wall,
+or any ordinary WiFi dropout ends the mission mid-route. The deadman makes that
+*safe* — the vehicle stops — but a robot that stops whenever the operator looks
+away is not doing the thing that was asked. On the router, the loop from sensor
+to decision never leaves the vehicle, and WiFi carries only the destination going
+out and the map coming back, neither of which is time-critical.
+
+The supporting evidence, measured rather than argued:
+
+| | |
+|---|---|
+| whole chain on mipsel | `oe-inject` → `ouster-edge` → `slam2d-daemon`, all target binaries under the emulator |
+| result | 3840 packets, 0 missed columns, 59 revolutions, 59 matched, 19 cm error, score 69% of maximum |
+| speed | 60 revolutions processed in 3 s of wall clock — **2x real time**, and that is inside QEMU's TCG, which is not faster than the real part |
+| memory | `slam2d-daemon` peaks at **2.4 MB** RSS, of which 820 kB is the grid and pyramid for a 40 m map at 5 cm |
+| the ring | already in the router's memory; nothing has to be sent anywhere to start |
+
+The tablet keeps the job it already has and is good at: send a destination,
+display the map and the pose. Because the core is integer, it can also run the
+identical code on the identical data and get identical answers, which makes it a
+genuine second opinion rather than an approximation.
+
+A Xavier remains the answer if perception on camera imagery is ever wanted. It is
+not needed for this.
+
+What is still a prediction: 26 ms per scan on the real part. The emulator shows
+correctness and suggests the real-time margin is real, but QEMU is not a cycle
+model, and the router will also be relaying the camera at the same time. Both go
+on the list for when the board is powered.
+
+Whichever host, the robot needs only to execute velocity commands, which
 `agx-cmd` already encodes, and to stop by itself when the link goes quiet, which
-`teleop`'s deadman and `ouster-edge`'s zones already do. That reflex layer is
-what makes running a planner off-vehicle defensible rather than reckless.
+`teleop`'s deadman and `ouster-edge`'s zones already do.
 
 ### What is missing regardless of where it runs
 

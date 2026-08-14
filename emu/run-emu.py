@@ -451,6 +451,55 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
               b'"ring_cm"' in sse and b'"sectors"' in sse,
               f"got {sse[-160:]!r}")
 
+        # --- slam2d on the ring ouster-edge just produced ---
+        #
+        # A smoke test, deliberately. The trajectory accuracy of the matcher is
+        # covered by slam2d/test, on both x86 and mipsel; what only the guest can
+        # show is that the daemon runs there, binds, consumes the real ring from
+        # the real ouster-edge, and does not invent motion.
+        #
+        # That last part is the check worth having. feed_lidar's scene is static,
+        # so a correct matcher reports a pose that stays where it started. A
+        # matcher that drifts on a stationary robot is broken in a way that a
+        # map picture would not reveal.
+        if emu.cmd("[ -x /usr/sbin/slam2d-daemon ] && echo yes || echo no") == "yes":
+            print("\n  slam2d on the guest")
+            out = emu.cmd("slam2d-daemon -f -p 7802 -S /tmp/slam2d.json -I 200 "
+                          ">/tmp/slam2d.log 2>&1 & echo PID=$!")
+            s2pid = None
+            for tok in (out or "").replace("\n", " ").split():
+                if tok.startswith("PID=") and tok[4:].isdigit():
+                    s2pid = tok[4:]
+            emu.cmd("uci set ouster-edge.lidar.ring='127.0.0.1:7802'; "
+                    "uci commit ouster-edge; /etc/init.d/ouster-edge restart",
+                    timeout=40)
+            time.sleep(2)
+            feed_lidar(FWD_UDP[7502], seconds=4.0)
+            time.sleep(1.5)
+            raw = emu.cmd("tr -d ' \\n\\t' < /tmp/slam2d.json 2>/dev/null")
+            snap = {}
+            if raw:
+                import json as _js
+                try:
+                    snap = _js.loads(raw)
+                except Exception:
+                    snap = {}
+            check("slam2d received rings from ouster-edge",
+                  snap.get("rings", 0) > 0, f"rings={snap.get('rings')}")
+            check("slam2d matched at least one",
+                  snap.get("matched", 0) > 0, f"matched={snap.get('matched')}")
+            check("no malformed rings", snap.get("skipped_malformed", -1) == 0,
+                  f"malformed={snap.get('skipped_malformed')}")
+            pose = snap.get("pose", {})
+            drift = max(abs(pose.get("x_m", 9)), abs(pose.get("y_m", 9)))
+            check("a stationary scene produces no drift", drift < 0.30,
+                  f"pose ({pose.get('x_m')}, {pose.get('y_m')}) m")
+            if s2pid:
+                emu.cmd(f"kill {s2pid} 2>/dev/null; echo ok")
+        else:
+            print("\n  slam2d on the guest")
+            print("  INFO  slam2d not in this image; select CONFIG_PACKAGE_slam2d=y")
+
         # --- CAN on the guest's own kernel, not the host's ---
         print("\n  can-bridge on the guest")
         # Not `ip -br`: BusyBox's ip has no brief mode, and using it here made a

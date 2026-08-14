@@ -15,12 +15,25 @@
  * builds.
  *
  *     oe-inject PORT COUNT [USEC_GAP]
+ *     oe-inject PORT COUNT USEC_GAP --room
+ *
+ * With --room the ranges come from a simulated 12 x 8 m room seen by a robot
+ * driving through it, rather than from a fixed wall. That turns the whole chain
+ * into something testable on the target: oe-inject makes lidar packets,
+ * ouster-edge reduces them to a ring, slam2d-daemon maps the ring, and the pose
+ * slam2d reports can be compared against the pose oe-inject was simulating.
+ * Every stage is the real binary on the real architecture.
+ *
+ * The room maths uses doubles. That is fine and does not weaken the claim about
+ * slam2d: this program stands in for the physical world, and what crosses into
+ * the code under test is the same integer packet a sensor would send.
  *
  * The layout matches what run-emu.py generates and what ouster-edge is told to
  * expect with -c 64 -C 16: a 32 byte packet header, 16 columns of a 12 byte
  * column header plus 64 pixels of 12 bytes, and a 32 byte footer.
  */
 #include <arpa/inet.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,22 +60,69 @@ static void put16(unsigned char *p, unsigned int v)
 	p[0] = v & 0xff; p[1] = (v >> 8) & 0xff;
 }
 
+/* ------------------------------------------------------- simulated room */
+
+/* The same 12 x 8 m room the slam2d tests use, with two stub walls so the
+ * place is not symmetric and a wrong heading cannot score as well as the right
+ * one. */
+static const double room[][4] = {
+	{ -6, -4,  6, -4 }, {  6, -4,  6,  4 },
+	{  6,  4, -6,  4 }, { -6,  4, -6, -4 },
+	{  1, -4,  1,  0 }, { -3,  4, -3,  1 },
+};
+
+static double room_ray(double px, double py, double ang)
+{
+	double dx = cos(ang), dy = sin(ang), best = 1e9;
+	unsigned i;
+
+	for (i = 0; i < sizeof(room) / sizeof(room[0]); i++) {
+		double x0 = room[i][0], y0 = room[i][1];
+		double ex = room[i][2] - x0, ey = room[i][3] - y0;
+		double den = dx * ey - dy * ex;
+		double t, u;
+
+		if (fabs(den) < 1e-12)
+			continue;
+		t = ((x0 - px) * ey - (y0 - py) * ex) / den;
+		u = ((x0 - px) * dy - (y0 - py) * dx) / den;
+		if (t > 0.05 && u >= 0 && u <= 1 && t < best)
+			best = t;
+	}
+	return best;
+}
+
+/* Where the robot is at revolution `frame`, and where it is looking. The same
+ * path the slam2d tests use, so the numbers are comparable. */
+static void room_pose(unsigned frame, double *x, double *y, double *th)
+{
+	double t = frame * 0.05;
+
+	*x = 3.0 * sin(t);
+	*y = 2.0 * (1 - cos(t));
+	*th = 0.35 * sin(t * 1.3);
+}
+
 int main(int argc, char **argv)
 {
 	static unsigned char pkt[PKT_SZ];
 	struct sockaddr_in to;
 	unsigned long count, sent = 0;
 	unsigned int gap = 0, mid = 0, frame = 100;
-	int s, port;
+	int s, port, i, use_room = 0;
 
 	if (argc < 3) {
-		fprintf(stderr, "usage: %s PORT COUNT [USEC_GAP]\n", argv[0]);
+		fprintf(stderr, "usage: %s PORT COUNT [USEC_GAP] [--room]\n",
+			argv[0]);
 		return 2;
 	}
 	port = atoi(argv[1]);
 	count = strtoul(argv[2], NULL, 10);
-	if (argc > 3)
+	if (argc > 3 && argv[3][0] != '-')
 		gap = (unsigned int)strtoul(argv[3], NULL, 10);
+	for (i = 3; i < argc; i++)
+		if (!strcmp(argv[i], "--room"))
+			use_room = 1;
 
 	s = socket(AF_INET, SOCK_DGRAM, 0);
 	if (s < 0) {
@@ -99,11 +159,33 @@ int main(int argc, char **argv)
 			put16(col + 8, m);		/* measurement id */
 			put16(col + 10, 1);		/* status: valid */
 
-			/* A wall at 4 m, and something inside 2 m in one arc,
-			 * so the zone path is exercised rather than skipped. */
-			for (ch = 0; ch < CH; ch++)
-				put32(col + COL_HDR + ch * PX,
-				      (m >= 100 && m < 130) ? 1800 : 4000);
+			if (use_room) {
+				double px, py, th, r;
+				unsigned int mm;
+
+				/* frame starts at 100, so the trajectory is
+				 * zero-based rather than starting mid-path. */
+				room_pose(frame - 100, &px, &py, &th);
+				r = room_ray(px, py,
+					     th + 2 * M_PI * m / WIDTH);
+				mm = (r > 30.0) ? 0 : (unsigned int)(r * 1000);
+				/* Every channel gets the same range, so the
+				 * minimum ouster-edge takes over the band is
+				 * the planar range. A real sensor on a vehicle
+				 * would see the floor on the lower beams; that
+				 * is a mounting and channel_band question, not
+				 * one this harness should silently answer. */
+				for (ch = 0; ch < CH; ch++)
+					put32(col + COL_HDR + ch * PX, mm);
+			} else {
+				/* A wall at 4 m, and something inside 2 m in
+				 * one arc, so the zone path is exercised
+				 * rather than skipped. */
+				for (ch = 0; ch < CH; ch++)
+					put32(col + COL_HDR + ch * PX,
+					      (m >= 100 && m < 130) ? 1800
+								    : 4000);
+			}
 		}
 
 		if (send(s, pkt, sizeof(pkt), 0) < 0) {
