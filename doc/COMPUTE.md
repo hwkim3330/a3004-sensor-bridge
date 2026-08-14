@@ -166,7 +166,30 @@ Measured on the board, sensor on a router LAN port at `2048x10` with
 | losses | `bad_size` 0, `invalid_columns` 0, **`missed_columns` 0** |
 | cost | **29.9% of one CPU**, **234 µs per datagram** |
 
-At `512x10` the same daemon costs 5.3% of one CPU and 167 µs per datagram.
+Every mode the sensor offers, measured the same way on the board:
+
+| mode | profile | datagrams/s | bytes | cpu | µs/datagram | missed |
+|---|---|---|---|---|---|---|
+| 512x10 | RNG15 | 321 | 4352 | 5.4% | 168 | 0 |
+| 512x10 | RNG19 | 320 | 12544 | 8.2% | 256 | 0 |
+| 1024x10 | RNG15 | 640 | 4352 | 9.6% | 150 | 0 |
+| 1024x10 | RNG19 | 649 | 12544 | 14.3% | 221 | 0 |
+| 2048x10 | RNG15 | 1297 | 4352 | 18.1% | 139 | 0 |
+| **2048x10** | **RNG19** | **1297** | **12544** | **28.0%** | 216 | **0** |
+| 512x20 | RNG19 | 649 | 12544 | 14.6% | 225 | 0 |
+| 1024x20 | RNG19 | 1280 | 12544 | 27.7% | 216 | 0 |
+
+**Not one dropped datagram anywhere in that table**, including 126 Mbit/s of
+fragmented UDP. Three things it says beyond the headline:
+
+- **The per-datagram cost falls as the rate rises** - 168 to 150 to 139 µs for
+  RNG15 as the rate triples. That is the fixed cost of each wakeup being spread
+  over a fuller `recvmmsg` batch, which is the batching doing its job.
+- **RNG19 costs about half again as much as RNG15** per datagram, for three
+  times the bytes. The work is per pixel and mostly independent of pixel width;
+  only the stride changes.
+- 1024x20 and 2048x10 are the same data rate by different means and cost the
+  same, which is a small consistency check on the whole table.
 
 So 126 Mbit/s of fragmented UDP arrives intact and is reduced to a ring for
 under a third of one of the four hardware threads. The scaling estimate below
