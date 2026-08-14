@@ -124,6 +124,35 @@ else
 	say "== flashing, WIPING configuration"
 fi
 
+#
+# Check the compat versions before asking, and say what it means.
+#
+# On mt7621 the subtarget's board.d stamps every device's config as compat
+# version 1.1 - that catch-all exists for the swconfig-to-DSA migration - while
+# an image declares 1.0 unless it inherits Device/dsa-migration, which only six
+# of the 321 devices in mt7621.mk do. A new device has never had a swconfig
+# config, so claiming that migration would be false; the honest position is that
+# this board needs -n, like most of its subtarget.
+#
+# Without this the attempt just prints "Image check failed" and reads as a fault.
+DEVCOMPAT="$($SSH "root@$HOST" "uci -q get system.@system[0].compat_version" 2>/dev/null)"
+IMGCOMPAT="$(staging_dir/host/bin/fwtool -i /tmp/fr-meta.$$ -t "$IMGDIR/$IMG" >/dev/null 2>&1 &&
+	     sed -n 's/.*"compat_version": *"\([^"]*\)".*/\1/p' /tmp/fr-meta.$$)"
+rm -f /tmp/fr-meta.$$
+if [ -n "$DEVCOMPAT" ] && [ -n "$IMGCOMPAT" ] && [ "$DEVCOMPAT" != "$IMGCOMPAT" ]; then
+	say "   config version $DEVCOMPAT, image $IMGCOMPAT"
+	if [ "${DEVCOMPAT%.*}" != "${IMGCOMPAT%.*}" ]; then
+		say "   major versions differ: sysupgrade will refuse outright"
+		exit 1
+	fi
+	if [ "$KEEP" = 1 ]; then
+		say "   minor versions differ, so the config cannot be carried over."
+		say "   This is normal on mt7621: its board.d marks every config 1.1"
+		say "   and this image declares 1.0. Re-run with --reset."
+		exit 1
+	fi
+fi
+
 # sysupgrade takes ubus down with it, so its exit status here means nothing.
 $SSH "root@$HOST" "sysupgrade $FLAGS /tmp/$IMG" 2>&1 | sed 's/^/  /'
 

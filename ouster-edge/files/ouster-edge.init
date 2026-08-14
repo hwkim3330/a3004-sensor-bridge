@@ -56,10 +56,9 @@ start_service() {
 	# the floor as soon as the sensor is on a vehicle, and the right indices
 	# depend on the beam layout rather than being fixed.
 	if [ -n "$sensor_ip" ]; then
-		local cfgout
+		local cfgout auto_band
 		if cfgout="$(/usr/sbin/ouster-configure "$sensor_ip" --apply 2>&1)"; then
 			logger -t ouster-edge "$(echo "$cfgout" | grep -v '^OUSTER_' | tr '\n' ' ')"
-			local auto_band
 			auto_band="$(echo "$cfgout" | sed -n 's/^OUSTER_CHANNEL_BAND=//p')"
 			if [ -z "$channel_band" ] && [ -n "$auto_band" ]; then
 				channel_band="$auto_band"
@@ -67,7 +66,39 @@ start_service() {
 				  "channel_band unset; using the horizontal rows $channel_band"
 			fi
 		else
-			logger -t ouster-edge "could not configure sensor $sensor_ip"
+			#
+			# The sensor is almost certainly still booting.
+			#
+			# This service starts late but the router still finishes before an
+			# OS-1 serves HTTP, so reading the sensor here fails for reasons
+			# that are only about ordering - and the log said "could not
+			# configure sensor" as though something were wrong. Waiting here
+			# would hold up procd for a minute, so the wait goes to the
+			# background and this start proceeds with what it knows.
+			#
+			# The restart is guarded on channel_band still being empty, which
+			# is the same condition that spawned this, so it happens once and
+			# cannot loop: by the time it runs, the value is set.
+			logger -t ouster-edge \
+			  "sensor $sensor_ip not answering yet; waiting for it in the background"
+			if [ -z "$channel_band" ]; then
+				(
+					out="$(/usr/sbin/ouster-configure "$sensor_ip" \
+						--apply --wait 180 2>&1)"
+					band="$(echo "$out" | sed -n 's/^OUSTER_CHANNEL_BAND=//p')"
+					if [ -n "$band" ] &&
+					   [ -z "$(uci -q get ouster-edge.lidar.channel_band)" ]; then
+						uci set ouster-edge.lidar.channel_band="$band"
+						uci commit ouster-edge
+						logger -t ouster-edge \
+						  "sensor answered late; channel_band $band, restarting"
+						/etc/init.d/ouster-edge restart
+					else
+						logger -t ouster-edge \
+						  "sensor still not answering: $(echo "$out" | tail -1)"
+					fi
+				) >/dev/null 2>&1 &
+			fi
 		fi
 	fi
 

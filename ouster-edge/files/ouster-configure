@@ -25,7 +25,15 @@
 HOST="$1"
 [ -n "$HOST" ] || { echo "usage: ouster-configure <sensor-ip> [--apply]" >&2; exit 2; }
 APPLY=""
-[ "$2" = "--apply" ] && APPLY=1
+WAIT=0
+shift
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--apply) APPLY=1 ;;
+	--wait)  WAIT="$2"; shift ;;
+	esac
+	shift
+done
 
 TMP="/tmp/ouster-configure.$$"
 trap 'rm -f "$TMP" "$TMP".b' EXIT
@@ -52,7 +60,22 @@ uci_get() {
 	uci -q get "ouster-edge.lidar.$1" 2>/dev/null
 }
 
-get_cfg || { echo "cannot reach $HOST" >&2; exit 1; }
+#
+# Wait, if asked. The router finishes booting well before the sensor does - the
+# OS-1 takes tens of seconds to serve HTTP - so a service that reads the sensor
+# at start finds nothing and logs a failure that is only about ordering. A short
+# retry does not fix that; the wait has to be longer than the sensor's own boot.
+waited=0
+until get_cfg; do
+	[ "$waited" -lt "$WAIT" ] || {
+		echo "cannot reach $HOST after ${waited}s" >&2
+		exit 1
+	}
+	sleep 5
+	waited=$((waited + 5))
+done
+[ "$waited" -gt 0 ] && echo "sensor answered after ${waited}s"
+
 
 CUR_AZ_START="$(field azimuth_window[0])"
 CUR_AZ_END="$(field azimuth_window[1])"
