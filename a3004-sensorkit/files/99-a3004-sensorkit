@@ -26,7 +26,17 @@ set ustreamer.video0.enabled='1'
 set ustreamer.video0.device='/dev/video0'
 set ustreamer.video0.resolution='1280x720'
 set ustreamer.video0.format='MJPEG'
-set ustreamer.video0.encoder='CPU'
+# HW, not CPU. The comment above says the camera does the encoding and
+# ustreamer relays, and the setting said the opposite: CPU makes ustreamer
+# decode the camera's JPEG and re-encode it in software. Measured on the board
+# at 1280x720 and 21 fps that cost 28.2% of a CPU - about the same as the whole
+# of slam2d - to arrive at a picture the camera had already produced. HW means
+# pass the device's own JPEG through untouched.
+#
+# Not yet verified: the camera is unpowered as this is written, so the expected
+# drop to near zero is a prediction. quality and workers have no effect in this
+# mode either, since nothing is being encoded here.
+set ustreamer.video0.encoder='HW'
 set ustreamer.video0.desired_fps='20'
 set ustreamer.video0.quality='80'
 set ustreamer.video0.host='0.0.0.0'
