@@ -207,6 +207,100 @@ measured on a wide out-of-order core says nothing reliable about a 1004Kc, in
 either direction. The 60%-of-a-CPU estimate above inherits that same weakness
 and stays labelled a prediction until the board is powered.
 
+## 2D instead: tap a destination and drive there
+
+A different question from the one above, and a much better-shaped one. Mapping a
+building and navigating it in 2D does not need the 3D pipeline at all.
+
+**The ring is already a 2D scan.** `ouster-edge` reduces each revolution to a
+per-azimuth minimum range — 360 sectors at 10 Hz, 88 kbit/s. That is a
+`LaserScan` in everything but name, and it is the thing the router is already
+good at producing.
+
+**What it costs.** Measured on this desktop, same machine as the 3D figure so the
+ratio means something: scan matching by ICP over the 360 points takes **2.5 ms**
+and folding them into a 5 cm occupancy grid takes **0.07 ms**, so 2.6% of the
+100 ms budget at 10 Hz. Against 11.4 ms for KISS-ICP on 50000 3D returns, the 3D
+problem is **4.4x** the work. Both figures are numpy with a KD-tree rather than a
+production package, and the first attempt at the 2D number came out at 35 ms —
+slower than the 3D one — purely because it built a 360x360 distance matrix per
+iteration. That is worth remembering before concluding anything from a
+measurement: the number described the loop, not the problem.
+
+### The trap: the default ring is not a planar slice
+
+`ouster-edge` takes the minimum over channels `ch_lo..ch_hi`, and the default is
+`0..127` — **every beam**. On a desk that is harmless. Mounted on a vehicle it
+destroys the scan, because the nearest return in any direction becomes the floor:
+
+| sensor height | floor hit at −22.5° | at −15° | at −10° |
+|---|---|---|---|
+| 0.2 m | 0.5 m | 0.8 m | 1.2 m |
+| 0.3 m | 0.8 m | 1.2 m | 1.7 m |
+| 0.5 m | 1.3 m | 1.9 m | 2.9 m |
+
+On a SCOUT MINI at roughly 0.3 m the ring becomes a uniform 0.8 m circle in every
+direction and carries no map information whatever. The fix is configuration, not
+code: set `channel_band` to the beams within a degree or two of horizontal. Read
+`beam_altitude_angles` from the sensor to pick them — they are not evenly
+indexed, and `ouster-metadata` already fetches that document.
+
+Also worth knowing: 360 sectors is 1°, which is 20 cm of arc at 12 m. Fine for a
+5 cm grid nearby and coarse far away. `--sectors 720` halves that and doubles the
+88 kbit/s, which is still nothing.
+
+### Where it runs, and why not on the router
+
+Not on the router, and the reason is not the point count — it is
+**`CONFIG_SOFT_FLOAT=y`**. MT7621 has no FPU, so every floating-point operation
+is a libgcc call. Scan matching is almost entirely floating point. Scaled by the
+same 15x used above, 2.5 ms becomes ~39 ms, which would fit; multiply that by a
+soft-float penalty and it does not. The router has no ROS either, and 4.7 MiB of
+overlay.
+
+**The tablet is the natural place.** It has an FPU and NEON, it is already
+receiving the ring, and it is already where a destination would be tapped. The
+robot then needs only to execute velocity commands, which `agx-cmd` already
+encodes, and to stop by itself when the link goes quiet, which `teleop`'s deadman
+and `ouster-edge`'s zones already do. That reflex layer is what makes running the
+planner off-vehicle defensible rather than reckless.
+
+The alternative is one of the Xavier boxes above with ROS 2 and slam_toolbox plus
+nav2, which is the conventional answer and brings the JetPack 5 problem with it.
+
+### What is missing regardless of where it runs
+
+- **Odometry.** Scan matching alone drifts; SLAM wants wheel odometry as a prior.
+  AgileX publishes it and `agilex.c` decodes motion state, but nothing has ever
+  read it, because there is no USB-CAN adapter.
+- **The vehicle does not move.** Same blocker as everything else.
+- **Which protocol generation** the vehicle speaks — see SCOUT-FIRMWARE.md.
+
+So the honest order is unchanged: adapter first, listen, confirm the generation,
+then the lateral sign with the wheels clear, and only then is a destination on a
+map a meaningful thing to tap.
+
+## Bluetooth: no, and what it would cost
+
+There is none. No BT node in the device tree, and the mt7615 driver contains no
+Bluetooth or coexistence code at all — MT7615D is a WiFi-only part, not one of
+MediaTek's combo chips. So the only route is a USB dongle.
+
+That was measured rather than guessed, by building the image both ways:
+
+| | image | overlay left |
+|---|---|---|
+| baseline | 11328 KB | 4800 KB |
+| with `kmod-bluetooth`, `kmod-btusb`, `bluez-utils` | 11968 KB | 4160 KB |
+
+**640 KB**, or about 13% of the overlay, and the firmware partition is 16128 KB
+so nothing overflows. Affordable, if a reason ever appears. It also pulls in
+`kmod-hid`, `kmod-input-evdev` and three crypto modules.
+
+The practical blocker is not size: there is no BT dongle on the router and none
+on this desktop either, so the path cannot even be exercised through the
+emulator's USB passthrough the way the camera can.
+
 ## The thing to do before either
 
 None of this is the binding constraint right now. **The vehicle does not move
