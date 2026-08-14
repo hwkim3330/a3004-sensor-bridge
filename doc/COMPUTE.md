@@ -152,7 +152,35 @@ What does spread:
 eth/mt76/xhci, and the current RPS masks, so the next time the board is powered
 this stops being an inference.
 
-### What full-rate lidar would cost the router
+### What full-rate lidar costs the router — measured
+
+The prediction below was wrong by a factor of two, in the safe direction, and is
+kept underneath because the method is what produced the error.
+
+Measured on the board, sensor on a router LAN port at `2048x10` with
+`RNG19_RFL8_SIG16_NIR16`:
+
+| | |
+|---|---|
+| received | **1280 datagrams/s**, exactly the expected rate |
+| losses | `bad_size` 0, `invalid_columns` 0, **`missed_columns` 0** |
+| cost | **29.9% of one CPU**, **234 µs per datagram** |
+
+At `512x10` the same daemon costs 5.3% of one CPU and 167 µs per datagram.
+
+So 126 Mbit/s of fragmented UDP arrives intact and is reduced to a ring for
+under a third of one of the four hardware threads. The scaling estimate below
+said 480 µs and 60%; the real ratio against this desktop is about **5x**, not the
+15x assumed. Predictions from clock and IPC alone were too pessimistic, and the
+right conclusion is not "the estimate was close enough" but that an estimate of
+this kind is worth roughly a factor of two either way.
+
+Also read off the board for the first time, since it had never been powered with
+a report that asked: **4 logical CPUs, MIPS 1004Kc V2.15, 242 MB of RAM** with
+151 MB available. The RAM matters - `slam2d-daemon` peaks at 2.4 MB, so the
+40 m map at 5 cm is not close to a constraint.
+
+### The earlier prediction, kept for the method
 
 Same method as the Xavier estimate: measure here, scale by clock and IPC, and
 label it a prediction. `ouster-edge` built native and fed the live sensor at
