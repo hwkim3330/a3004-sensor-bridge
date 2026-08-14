@@ -332,6 +332,31 @@ without a soft-float penalty because there is no float to penalise. That number
 is a prediction until the board is powered; what the emulator establishes is
 correctness, not speed.
 
+### It runs there. Measured on the board.
+
+The image is flashed and the chain is live: sensor on a LAN port, ouster-edge,
+slam2d, at 1024x10 with RNG19.
+
+| | 40 m map | **20 m map, band 28:33** |
+|---|---|---|
+| slam2d | 67.8 ms/scan, 67.5% of one CPU | **29.1 ms/scan, 29.4%** |
+| ouster-edge | 23.8% | **11.9%** |
+| together | 91.3% of one CPU | **41.3% — 10.3% of the machine** |
+| match score | 85% | **87%** |
+| resident | 1792 kB | under 2 MB |
+
+10.1 revolutions a second, which is the sensor's rate, with no drift from a
+stationary sensor and `at_search_edge` false throughout.
+
+**The prediction was 15 ms and it came out at 67.8, and the reason matters more
+than the miss.** ouster-edge runs 5x slower on this part than on the desktop;
+slam2d runs 71x slower. They are not the same kind of work. One streams through
+packet bytes in order and caches perfectly; the other reads 675 candidate poses
+times 250 points at random across the occupancy grid, and 818 kB does not fit a
+1004Kc's cache. Halving the map edge to 20 m quarters the memory, does not change
+the number of lookups at all, and more than halves the time. Scaling by clock and
+IPC was never going to see that.
+
 ### The decision: on the router
 
 All three hosts became possible once the floating point was gone, so the choice
