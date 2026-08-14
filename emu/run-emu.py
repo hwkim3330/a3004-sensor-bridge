@@ -41,7 +41,7 @@ TREE = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 # Guest port -> host port. QEMU user-mode networking forwards both TCP and UDP,
 # which is what lets the lidar feed be injected from outside.
 FWD_TCP = {80: 8180, 8080: 8280, 8082: 8282, 8083: 8283, 7603: 8303}
-FWD_UDP = {7502: 8502, 7721: 8721, 7701: 8701}
+FWD_UDP = {7502: 8502, 7721: 8721, 7701: 8701, 7814: 8814}
 
 # OpenWrt's br-lan is statically 192.168.1.1 and never asks for DHCP, so QEMU's
 # user network is pointed at the same subnet and forwards are addressed to that
@@ -476,7 +476,7 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
             time.sleep(2)
             feed_lidar(FWD_UDP[7502], seconds=4.0)
             time.sleep(1.5)
-            raw = emu.cmd("tr -d ' \\n\\t' < /tmp/slam2d.json 2>/dev/null")
+            raw = emu.cmd("tr -d '\\n\\t' < /tmp/slam2d.json 2>/dev/null")
             snap = {}
             if raw:
                 import json as _js
@@ -499,6 +499,69 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
         else:
             print("\n  slam2d on the guest")
             print("  INFO  slam2d not in this image; select CONFIG_PACKAGE_slam2d=y")
+
+        # --- navigate, on the ring slam2d just proved it can consume ---
+        #
+        # A smoke test again: the planner and the watchers are covered
+        # closed-loop in navigate/test, and against the real sensor. What only
+        # the guest shows is that it runs on mipsel, takes the same ring, and -
+        # the part worth the boot - refuses a destination it cannot reach with a
+        # reason a person could act on, rather than a single word.
+        if emu.cmd("[ -x /usr/sbin/navigate ] && echo yes || echo no") == "yes":
+            print("\n  navigate on the guest")
+            out = emu.cmd("navigate -f -p 7812 -c 7814 -D -S /tmp/nav.json "
+                          "-I 200 >/tmp/nav.log 2>&1 & echo PID=$!")
+            npid = None
+            for tok in (out or "").replace("\n", " ").split():
+                if tok.startswith("PID=") and tok[4:].isdigit():
+                    npid = tok[4:]
+            emu.cmd("uci set ouster-edge.lidar.ring='127.0.0.1:7812'; "
+                    "uci commit ouster-edge; /etc/init.d/ouster-edge restart",
+                    timeout=40)
+            time.sleep(2)
+            feed_lidar(FWD_UDP[7502], seconds=4.0)
+            time.sleep(1.5)
+
+            def nav():
+                raw = emu.cmd("tr -d '\\n\\t' < /tmp/nav.json 2>/dev/null")
+                if not raw:
+                    return {}
+                import json as _j
+                try:
+                    return _j.loads(raw)
+                except Exception:
+                    return {}
+
+            snap = nav()
+            check("navigate consumed the ring", snap.get("matched", 0) > 0,
+                  f"matched={snap.get('matched')}")
+            check("idle until given a goal", snap.get("state") == "idle",
+                  f"state={snap.get('state')}")
+            check("commands nothing while idle", snap.get("tele_sent", 1) == 0,
+                  f"tele_sent={snap.get('tele_sent')}")
+
+            # Sent from the host through QEMU's forward, the same way the lidar
+            # and CAN checks inject. busybox nc only speaks UDP when the image
+            # was built with NC_EXTRA, which is not something to depend on.
+            #
+            # Far outside a 40 m map, so the answer is not a matter of degree.
+            gs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            gs.sendto(b"GOAL 900000 900000", ("127.0.0.1", FWD_UDP[7814]))
+            gs.close()
+            time.sleep(1.5)
+            snap = nav()
+            fault = (snap.get("fault") or "")
+            check("an off-map destination is refused",
+                  snap.get("state") == "stopped", f"state={snap.get('state')}")
+            check("and says which of the reasons it was",
+                  "outside the map" in fault, f"fault={fault!r}")
+            check("still commanded nothing", snap.get("tele_sent", 1) == 0,
+                  f"tele_sent={snap.get('tele_sent')}")
+            if npid:
+                emu.cmd(f"kill {npid} 2>/dev/null; echo ok")
+        else:
+            print("\n  navigate on the guest")
+            print("  INFO  navigate not in this image; select CONFIG_PACKAGE_navigate=y")
 
         # --- CAN on the guest's own kernel, not the host's ---
         print("\n  can-bridge on the guest")
@@ -555,7 +618,7 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
             # One snapshot, parsed once. Reading the file three times gave
             # three different instants and made rx=0 sit next to a decoded
             # frame, which cannot both be true.
-            raw = emu.cmd("cat /var/run/can-bridge.json 2>/dev/null | tr -d ' \\n\\t'")
+            raw = emu.cmd("cat /var/run/can-bridge.json 2>/dev/null | tr -d '\\n\\t'")
             snap = {}
             if raw:
                 import json as _json
@@ -612,7 +675,7 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
             time.sleep(2.0)
 
             raw2 = emu.cmd("cat /var/run/can-bridge.json 2>/dev/null "
-                           "| tr -d ' \\n\\t'")
+                           "| tr -d '\\n\\t'")
             snap2 = {}
             if raw2:
                 import json as _json2
@@ -653,7 +716,7 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
                 check("host could feed the port", n > 0, f"{n} {err}")
                 time.sleep(0.5)
                 st = emu.cmd("cat /var/run/rc-ibus.json 2>/dev/null | "
-                             "tr -d ' \\n\\t' | head -c 300")
+                             "tr -d '\\n\\t' | head -c 300")
                 check("rc-ibus decoded frames on mipsel",
                       bool(st and '"link":true' in st), f"got {st!r}")
                 check("no checksum errors over the emulated link",
