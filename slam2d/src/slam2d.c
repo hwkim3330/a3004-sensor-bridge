@@ -265,12 +265,41 @@ static void ray_free(struct s2_map *m, int32_t x0, int32_t y0, int32_t x1,
 	}
 }
 
+/*
+ * Sector index to angle, by table.
+ *
+ * This was (int64_t)sector * S2_TURN / sectors, evaluated per point per
+ * rotation. The 64-bit cast was never needed - sector * 4096 tops out at 16.7
+ * million - and it pulled in __divdi3, so every scan point cost a call into
+ * libgcc for a division whose answer is the same every time. A table built when
+ * the sector count changes removes both.
+ */
+static int32_t *sector_ang;
+static int sector_ang_n;
+
+static int32_t sector_angle(int sector, int sectors)
+{
+	if (sectors != sector_ang_n) {
+		int32_t *t = malloc(sizeof(int32_t) * (size_t)sectors);
+		int i;
+
+		if (!t)
+			return (int32_t)(sector * S2_TURN / sectors);
+		for (i = 0; i < sectors; i++)
+			t[i] = (int32_t)(i * S2_TURN / sectors);
+		free(sector_ang);
+		sector_ang = t;
+		sector_ang_n = sectors;
+	}
+	return sector_ang[sector];
+}
+
 /* Where sector i of a scan taken at pose p lands, in centimetres. */
 static inline void sector_point(const struct s2_pose *p, int sector,
 				int sectors, int32_t range_cm,
 				int32_t *x_cm, int32_t *y_cm)
 {
-	int32_t a = p->a + (int32_t)((int64_t)sector * S2_TURN / sectors);
+	int32_t a = p->a + sector_angle(sector, sectors);
 
 	*x_cm = p->x_cm + (range_cm * s2_cos(a) >> 15);
 	*y_cm = p->y_cm + (range_cm * s2_sin(a) >> 15);
@@ -345,6 +374,9 @@ void s2_map_build_pyramid(struct s2_map *m)
  * per candidate is what keeps this affordable: the inner loop over translations
  * costs an add and a table lookup per point, with no multiplies at all.
  */
+static int32_t *scratch;
+static int scratch_n;
+
 struct rotated {
 	int32_t *dx;		/* centimetres from the sensor */
 	int32_t *dy;
@@ -417,7 +449,7 @@ static void rotate_scan(struct rotated *r, const uint16_t *ranges_cm,
 			continue;
 		if (max_range_cm && v > max_range_cm)
 			continue;
-		ang = a + (int32_t)((int64_t)i * S2_TURN / sectors);
+		ang = a + sector_angle(i, sectors);
 		r->dx[r->n] = (int32_t)v * s2_cos(ang) >> 15;
 		r->dy[r->n] = (int32_t)v * s2_sin(ang) >> 15;
 		r->n++;
@@ -438,14 +470,27 @@ bool s2_match(struct s2_map *m, const struct s2_pose *seed,
 	if (m->dirty)
 		s2_map_build_pyramid(m);
 
-	rot.dx = malloc(sizeof(int32_t) * (size_t)sectors);
-	rot.dy = malloc(sizeof(int32_t) * (size_t)sectors);
-	rot.qx = malloc(sizeof(int32_t) * (size_t)sectors);
-	rot.qy = malloc(sizeof(int32_t) * (size_t)sectors);
-	if (!rot.dx || !rot.dy || !rot.qx || !rot.qy) {
-		free(rot.dx); free(rot.dy); free(rot.qx); free(rot.qy);
-		return false;
+	/*
+	 * Scratch that outlives the call.
+	 *
+	 * This used to malloc four arrays and free them again on every scan -
+	 * forty allocations a second, for buffers whose size never changes. It
+	 * is wasteful anywhere and disqualifying on a microcontroller, where the
+	 * heap is small and fragmentation is permanent. Grown once and kept.
+	 */
+	if (scratch_n < sectors) {
+		int32_t *p = realloc(scratch, sizeof(int32_t) * 4u *
+					      (size_t)sectors);
+
+		if (!p)
+			return false;
+		scratch = p;
+		scratch_n = sectors;
 	}
+	rot.dx = scratch;
+	rot.dy = scratch + sectors;
+	rot.qx = scratch + 2 * sectors;
+	rot.qy = scratch + 3 * sectors;
 
 	/*
 	 * Coarse to fine. The first pass covers the whole window on the
@@ -534,10 +579,6 @@ bool s2_match(struct s2_map *m, const struct s2_pose *seed,
 			(seed->y_cm - best.y_cm >= win_xy_cm);
 	}
 
-	free(rot.dx);
-	free(rot.dy);
-	free(rot.qx);
-	free(rot.qy);
 	return ok;
 }
 
