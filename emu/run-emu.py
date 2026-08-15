@@ -272,13 +272,12 @@ class Emu:
         silent for over two minutes - and because a timeout there shifts every
         later result, one slow restart produced a page of unrelated failures.
         The service itself is not slow: its own log shows six seconds from the
-        first line to "listening on :7502". Why the console stays quiet for that
-        long is still not established - a buffered-read stall in read_until()
-        was checked and ruled out - so the restart runs in the foreground with a
-        generous timeout, which is what a person types and what demonstrably
-        takes effect. Detaching it looked tidier and did not restart the service
-        at all. The numbered markers in cmd() are what keep a slow restart from
-        costing anything but its own result.
+        first line to "listening on :7502". That was a real defect and it is
+        fixed: the background sensor wait inherited procd's service lock on fd
+        1000, so the next restart sat in `flock 1000` until that wait aged out.
+        A restart now takes about eight seconds. The timeout and the pid check
+        below stay, because a restart that silently does not happen is worth
+        catching either way.
 
         What is polled is a *new* pid, not merely a running one. Waiting for "a
         process by that name" returned instantly - the old instance was still
@@ -577,10 +576,9 @@ def run_once(kernel, endian, verbose, camera=None, ibus=False, radios=0):
             for tok in (out or "").replace("\n", " ").split():
                 if tok.startswith("PID=") and tok[4:].isdigit():
                     s2pid = tok[4:]
-            # 90 s, not 40. Starting this service calls ouster-configure,
-            # which tries to reach a sensor that does not exist here and waits
-            # out its HTTP timeout before giving up - on emulated mipsel that
-            # put the whole restart past 40 s and cost the slam2d results.
+            # 90 s is generous: a restart measures about eight seconds now
+            # that the sensor wait no longer holds procd's service lock. The
+            # margin is for a loaded host, not for the old defect.
             # How long an absent sensor costs. Reported rather than only
             # tolerated: this is the slowest step in the run, and it is the same
             # delay a real boot pays when the lidar is not powered.

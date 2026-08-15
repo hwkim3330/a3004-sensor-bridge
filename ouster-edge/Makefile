@@ -69,6 +69,7 @@ define Package/ouster-edge/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ouster-edge $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/ouster-metadata $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/ouster-configure $(1)/usr/sbin/
+	$(INSTALL_BIN) ./files/ouster-wait-band $(1)/usr/sbin/
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/ouster-edge.init $(1)/etc/init.d/ouster-edge
 	$(INSTALL_DIR) $(1)/etc/config

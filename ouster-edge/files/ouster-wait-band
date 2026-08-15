@@ -1,0 +1,59 @@
+#!/bin/sh
+# ouster-wait-band - wait for a sensor that is not there yet, then use it.
+#
+# The router finishes booting well before an OS-1 serves HTTP, so the channel
+# band cannot always be read at start. This waits for the sensor in the
+# background and applies the answer when it arrives.
+#
+# It is a separate program rather than a subshell inside the init script for two
+# reasons, both learned the hard way:
+#
+#   - A subshell left in the service's process group makes procd's stop wait for
+#     it. With no sensor attached that wait is this program's own 180 seconds,
+#     and `/etc/init.d/ouster-edge restart` did not return for five minutes -
+#     with the service's new pid already in place long before the shell came
+#     back. The init script now starts this with setsid, in its own session.
+#   - Quoting. The body used sed with a substitution pattern, inside a
+#     single-quoted `sh -c` string, inside an init script. That parses and does
+#     the wrong thing quietly.
+#
+#   ouster-wait-band <sensor-ip> [seconds]
+
+#
+# Close fd 1000 first. This is the whole reason a restart used to hang.
+#
+# procd_lock() in /lib/functions/procd.sh holds the per-service lock as
+# `exec 1000>/var/lock/procd_ouster-edge.lock; flock 1000`, and the init script
+# takes it before start_service runs. So this process is forked with fd 1000
+# already open and inherits the lock - and a flock lives as long as *any* fd on
+# it. That kept the lock alive for this program's whole 180-second wait, and the
+# next `/etc/init.d/ouster-edge restart` sat in `flock 1000` for the remainder:
+# five minutes with no output and nothing in the log. Traced to this line by
+# running the restart under `sh -x`, where it stops at "+ flock 1000".
+#
+# setsid does not help - a new session does not close file descriptors.
+exec 1000>&- 2>/dev/null
+
+HOST="$1"
+WAIT="${2:-180}"
+PIDFILE=/var/run/ouster-edge-wait.pid
+
+[ -n "$HOST" ] || exit 2
+
+out="$(/usr/sbin/ouster-configure "$HOST" --apply --wait "$WAIT" 2>&1)"
+band="$(echo "$out" | sed -n 's/^OUSTER_CHANNEL_BAND=//p')"
+
+# Guarded on channel_band still being empty, which is the same condition that
+# started this, so the restart happens once and cannot loop: by the time it
+# runs, the value is set.
+if [ -n "$band" ] && [ -z "$(uci -q get ouster-edge.lidar.channel_band)" ]; then
+	uci set ouster-edge.lidar.channel_band="$band"
+	uci commit ouster-edge
+	logger -t ouster-edge "sensor answered late; channel_band $band, restarting"
+	rm -f "$PIDFILE"
+	/etc/init.d/ouster-edge restart
+else
+	logger -t ouster-edge \
+	  "sensor still not answering: $(echo "$out" | tail -1)"
+	rm -f "$PIDFILE"
+fi

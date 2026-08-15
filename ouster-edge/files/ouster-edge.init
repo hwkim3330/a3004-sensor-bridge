@@ -6,6 +6,7 @@ USE_PROCD=1
 
 PROG=/usr/sbin/ouster-edge
 STATUS=/var/run/ouster-edge.json
+WAITPID=/var/run/ouster-edge-wait.pid
 
 append_zone() {
 	local cfg="$1"
@@ -93,22 +94,25 @@ start_service() {
 			logger -t ouster-edge \
 			  "sensor $sensor_ip not answering yet; waiting for it in the background"
 			if [ -z "$channel_band" ]; then
-				(
-					out="$(/usr/sbin/ouster-configure "$sensor_ip" \
-						--apply --wait 180 2>&1)"
-					band="$(echo "$out" | sed -n 's/^OUSTER_CHANNEL_BAND=//p')"
-					if [ -n "$band" ] &&
-					   [ -z "$(uci -q get ouster-edge.lidar.channel_band)" ]; then
-						uci set ouster-edge.lidar.channel_band="$band"
-						uci commit ouster-edge
-						logger -t ouster-edge \
-						  "sensor answered late; channel_band $band, restarting"
-						/etc/init.d/ouster-edge restart
-					else
-						logger -t ouster-edge \
-						  "sensor still not answering: $(echo "$out" | tail -1)"
-					fi
-				) >/dev/null 2>&1 &
+				#
+				# setsid, and a pid file.
+				#
+				# Backgrounding alone is not enough: a plain `&` leaves the
+				# waiter in the service's process group, and procd's stop
+				# signals that group and then waits for it. With no sensor
+				# attached that wait is the waiter's own 180 seconds, so
+				# `/etc/init.d/ouster-edge restart` did not return for five
+				# minutes - measured, with the service's new pid already in
+				# place long before the shell came back. A new session detaches
+				# it; stop_service kills it by pid, so a stopped service does
+				# not leave something polling hardware.
+				# 1000>&- as well as inside the waiter: the fd this closes
+				# is procd's service lock, and leaving it open in a child that
+				# lives for three minutes is what made restart block. Closed on
+				# both sides so neither file has to be read to know it is safe.
+				setsid /usr/sbin/ouster-wait-band "$sensor_ip" 180 \
+					>/dev/null 2>&1 1000>&- &
+				echo $! > "$WAITPID"
 			fi
 		fi
 	fi
@@ -174,6 +178,13 @@ start_service() {
 
 stop_service() {
 	rm -f "$STATUS"
+	# Anything still waiting for a sensor belongs to the service that asked
+	# for it. Leaving it behind means a stopped service keeps polling
+	# hardware, and a later start finds a second one doing the same.
+	if [ -f "$WAITPID" ]; then
+		kill "$(cat "$WAITPID")" 2>/dev/null
+		rm -f "$WAITPID"
+	fi
 }
 
 service_triggers() {

@@ -197,6 +197,39 @@ while :; do sed -n 's/.*"missed_columns": \([0-9]*\).*/\1/p' \
     /var/run/ouster-edge.json; sleep 2; done
 ```
 
+### If the sensor is not attached
+
+The service starts anyway. It probes the sensor once - bounded by `timeout 8`,
+because a start path that reaches out to hardware should have a bound - logs
+`sensor 192.168.1.50 not answering yet; waiting for it in the background`, and
+leaves `ouster-wait-band` polling for up to three minutes. When the sensor
+finally answers, that reads the horizontal channel band out of
+`beam_altitude_angles` and restarts the service with it.
+
+The waiter closes file descriptor 1000 before it does anything else, and that
+line is load-bearing. `procd_lock()` holds the per-service lock as
+`exec 1000>/var/lock/procd_ouster-edge.lock; flock 1000`, and the init script
+takes it before `start_service` runs - so a child forked from there inherits the
+lock, and a flock lives as long as any descriptor on it. Leaving it open meant
+the waiter held the lock for its whole three minutes and the next
+`/etc/init.d/ouster-edge restart` sat in `flock 1000` behind it:
+
+```
+restart, with the sensor absent     299 s      before
+restart, same conditions            8.5 s      after
+```
+
+Five minutes with no output and nothing in the log, while the service itself had
+already restarted - `ps` showed the new pid long before the shell returned. It
+was found by running the restart under `sh -x` through its real interpreter
+(`sh -x /etc/rc.common /etc/init.d/ouster-edge restart`), where the trace stops
+dead at `+ flock 1000`. Three earlier explanations - an unanswered ARP, a
+buffered read in the test harness, a race with procd's own reload trigger - were
+each measured and each wrong.
+
+Worth knowing generally: **anything backgrounded from `start_service` inherits
+that lock**. If you add one, close fd 1000 in it.
+
 ## 5b. Microphone
 
 The StreamCam's microphone is a separate USB audio device on the same cable.
