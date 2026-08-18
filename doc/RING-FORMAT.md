@@ -72,3 +72,56 @@ router failed to keep up with. It should stay at zero. If it climbs, run
 `pc-side/ring_to_laserscan.py` turns the datagram into a
 `sensor_msgs/LaserScan`, which is the message this data already is — a single
 ring of ranges at fixed angular increments. Nothing is lost in that conversion.
+
+## The range image: what the ring cannot carry
+
+`option range_image '1'` also writes `/var/run/range.bin`, symlinked to
+`/www/sensors/range.bin`, holding every Nth channel's nearest range per sector
+instead of one number per sector.
+
+```
+offset  size              field
+------  ----------------  ---------------------------------------------------
+     0                 4  magic, ASCII "OSRI"
+     4                 1  version, currently 1
+     5                 1  reserved
+     6                 2  columns (= sectors), uint16
+     8                 2  rows, uint16
+    10                 2  frame_id, uint16
+    12                 1  band_lo, first channel the ring uses
+    13                 1  band_hi, last
+    14                 1  row step: image row r is sensor channel r x step
+    15                 1  reserved
+    16                 8  timestamp of the revolution, ns
+    24  2 x rows x cols   range, uint16 cm, row-major, 0xFFFF = no return
+```
+
+`band_lo`/`band_hi` are included so a client can draw the horizon without asking
+the sensor for `beam_altitude_angles`: those rows are what the ring, and
+therefore the 2D map, is built from.
+
+**Why this exists.** The ring collapses `channel_band` into one range per
+direction, which is what a 2D occupancy grid wants and is blind to everything
+above and below it. A vehicle cares about the floor ending and about overhangs.
+One revolution on the bench carried **4643 returns across the rows and 160 in
+the ring's band** - and the ring's rows are the *sparsest*, because a horizontal
+beam often flies into open space while a downward one always finds the floor.
+
+**Why HTTP rather than a datagram.** 32x360 uint16 is 23 kB, which is sixteen IP
+fragments at a 1500-byte MTU. This project measured a nine-fragment datagram
+arriving at 58 % over WiFi in either band, because the limit is the frame rate
+rather than the bit rate - see `COMPUTE.md`. TCP segments and retransmits it for
+free, and the client already fetches the map the same way.
+
+**What it costs.** Every row is a range extraction per column, so the row step is
+not a detail:
+
+| rows | step | `ouster-edge` CPU | file |
+|---|---|---|---|
+| off | - | 66 % of one core | - |
+| 64 | 1 | **96 %** | 46 kB |
+| 32 | 2 | **82 %** | 23 kB |
+
+Thirty-two rows is the default. Sixty-four costs most of a core for vertical
+resolution that does not change the answer to "is that a floor, a step or an
+overhang".

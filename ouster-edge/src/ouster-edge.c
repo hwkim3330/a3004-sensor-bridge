@@ -141,6 +141,34 @@ static struct {
 	 * completed revolution, which is what gets published and evaluated so
 	 * readers never see a half-built ring. Units are centimetres, 0xffff
 	 * means no return in that sector. */
+	/*
+	 * The full range image, when asked for: one minimum range per (channel,
+	 * sector) rather than one per sector.
+	 *
+	 * The ring collapses `channel_band` - six of sixty-four rows here - into a
+	 * single number per direction, which is what a 2D map wants and is
+	 * blind to everything outside that band. A vehicle cares about what is
+	 * below it (a floor that stops, a step) and above it (an overhang), and
+	 * neither appears in the ring at all.
+	 *
+	 * Heap-allocated because channels x sectors is 23040 uint16 at the default
+	 * 64 x 360, which is not something to put in a static array sized for the
+	 * maximum of either.
+	 */
+	bool range_image;
+	/*
+	 * Row stride. Every channel costs a range extraction per column, and 64
+	 * rows against the ring's 6 measured as 30 % more of one CPU - 96 % from
+	 * 66 %, which is most of a core for a depth view. Two-row steps halve it
+	 * and lose almost nothing: what the view is for is telling a floor from a
+	 * step from an overhang, and that does not need every beam.
+	 */
+	int rimg_step;
+	int rimg_rows;			/* channels / step, rounded up */
+	uint16_t *rimg;			/* rimg_rows * sectors, cm, 0xffff = none */
+	uint16_t *rimg_pub;
+	char *rimg_path;
+
 	uint16_t ring_min[MAX_SECTORS];
 	uint16_t ring_pub[MAX_SECTORS];
 	uint8_t  ring_refl[MAX_SECTORS];
@@ -195,6 +223,14 @@ static inline uint32_t rd32(const uint8_t *p)
 static inline uint64_t rd64(const uint8_t *p)
 {
 	return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
+}
+
+static inline void wr64(uint8_t *p, uint64_t v)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		p[i] = (uint8_t)(v >> (8 * i));
 }
 
 /*
@@ -344,6 +380,12 @@ static void ring_reset(void)
 {
 	int i;
 
+	if (g.rimg) {
+		int n = g.rimg_rows * g.sectors;
+
+		for (i = 0; i < n; i++)
+			g.rimg[i] = 0xffff;
+	}
 	for (i = 0; i < g.sectors; i++) {
 		g.ring_min[i] = 0xffff;
 		g.ring_refl[i] = 0;
@@ -605,6 +647,73 @@ static size_t ring_json(char *buf, size_t cap)
 	return off;
 }
 
+/*
+ * Write the range image where uhttpd can serve it.
+ *
+ * Over TCP rather than as a datagram, and that is a measurement rather than a
+ * preference: 64 x 360 uint16 is 46 kB, which is 31 IP fragments at a 1500-byte
+ * MTU, and this project measured a 12544-byte datagram - nine fragments -
+ * arriving at 58 % over WiFi in either band because the limit is the frame rate.
+ * A file the client fetches gets TCP's segmentation and retransmission for free.
+ * See doc/COMPUTE.md.
+ *
+ *   0   4  "OSRI"
+ *   4   1  version, 1
+ *   5   1  reserved
+ *   6   2  columns (= sectors), uint16
+ *   8   2  rows (= channels), uint16
+ *  10   2  frame_id, uint16
+ *  12   1  band_lo, the first channel the ring uses
+ *  13   1  band_hi, the last
+ *  14   2  reserved
+ *  16   8  timestamp of the revolution, ns
+ *  24   2 x rows x cols  range, uint16 cm, row-major, 0xffff = no return
+ *
+ * band_lo/band_hi are there so a client can draw the horizon without fetching
+ * beam_altitude_angles from the sensor: those two rows are what the ring - and
+ * therefore the 2D map - is built from.
+ */
+static void rimg_write(void)
+{
+	char tmp[256];
+	uint8_t hdr[24];
+	size_t n;
+	FILE *f;
+
+	if (!g.rimg_path || !g.rimg_pub)
+		return;
+
+	snprintf(tmp, sizeof(tmp), "%s.tmp", g.rimg_path);
+	f = fopen(tmp, "wb");
+	if (!f)
+		return;
+
+	memset(hdr, 0, sizeof(hdr));
+	memcpy(hdr, "OSRI", 4);
+	hdr[4] = 1;
+	hdr[6] = (uint8_t)(g.sectors & 0xff);
+	hdr[7] = (uint8_t)(g.sectors >> 8);
+	hdr[8] = (uint8_t)(g.rimg_rows & 0xff);
+	hdr[9] = (uint8_t)(g.rimg_rows >> 8);
+	hdr[14] = (uint8_t)g.rimg_step;	/* so a client can label rows by channel */
+	hdr[10] = (uint8_t)(g.cur_frame & 0xff);
+	hdr[11] = (uint8_t)((g.cur_frame >> 8) & 0xff);
+	hdr[12] = (uint8_t)g.ch_lo;
+	hdr[13] = (uint8_t)g.ch_hi;
+	wr64(hdr + 16, g.frame_ts);
+
+	n = (size_t)g.rimg_rows * g.sectors;
+	if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+	    fwrite(g.rimg_pub, sizeof(g.rimg_pub[0]), n, f) != n) {
+		fclose(f);
+		unlink(tmp);
+		return;
+	}
+	fclose(f);
+	if (rename(tmp, g.rimg_path) < 0)
+		unlink(tmp);
+}
+
 static void status_write(void)
 {
 	char tmp[256];
@@ -670,6 +779,11 @@ static void status_write(void)
 
 	if (rename(tmp, g.status_path) < 0)
 		unlink(tmp);
+
+	/* Written at the status interval, not per revolution: 46 kB ten times a
+	 * second is 460 kB/s of tmpfs churn for a depth view that reads the same
+	 * at five. */
+	rimg_write();
 }
 
 static void frame_complete(int txsock)
@@ -677,6 +791,9 @@ static void frame_complete(int txsock)
 	g.st.frames++;
 	memcpy(g.ring_pub, g.ring_min, sizeof(g.ring_pub[0]) * g.sectors);
 	memcpy(g.ring_refl_pub, g.ring_refl, sizeof(g.ring_refl_pub[0]) * g.sectors);
+	if (g.rimg && g.rimg_pub)
+		memcpy(g.rimg_pub, g.rimg,
+		       sizeof(g.rimg_pub[0]) * (size_t)g.rimg_rows * g.sectors);
 	zones_revolution_end();
 	ring_publish(txsock);
 
@@ -769,11 +886,34 @@ static void packet_process(const uint8_t *pkt, size_t len, int txsock)
 			}
 		}
 
-		if (!best)
-			continue;
-
 		sector = (int)(((long)mid * g.sectors) / g.scan_width);
 		if (sector < 0 || sector >= g.sectors)
+			continue;
+
+		/*
+		 * Every channel, not just the band. Kept separate from the loop
+		 * above rather than merged into it: that one stops at the band
+		 * because the ring is defined that way, and widening it would
+		 * change what the ring means.
+		 */
+		if (g.rimg) {
+			int c, row = 0;
+
+			for (c = 0; c < g.channels && c < l->channels;
+			     c += g.rimg_step, row++) {
+				const uint8_t *p = px + (size_t)c * l->px;
+				uint32_t r = px_range_mm(l, p);
+				uint16_t cm;
+
+				if (r < g.min_range_mm || r > g.max_range_mm)
+					continue;
+				cm = (uint16_t)(r / 10u);
+				if (cm < g.rimg[(size_t)row * g.sectors + sector])
+					g.rimg[(size_t)row * g.sectors + sector] = cm;
+			}
+		}
+
+		if (!best)
 			continue;
 
 		zones_column(sector, best);
@@ -868,6 +1008,9 @@ static void usage(const char *argv0)
 "  -b, --channel-band LO:HI channel range to reduce over (default all)\n"
 "  -m, --min-range M        ignore returns closer than this (default 0.3)\n"
 "  -M, --max-range M        ignore returns further than this (default 200)\n"
+"  -G, --range-image PATH   write every channel's range per sector here, for a\n"
+"                           client that wants vertical structure the ring\n"
+"                           cannot carry. See doc/RING-FORMAT.md\n"
 "  -r, --relay HOST[:PORT]  forward every raw packet here (default port 7502)\n"
 "  -o, --ring HOST[:PORT]   send the derived ring here (default port 7602).\n"
 "                           Repeatable: the on-router mapper and an operator\n"
@@ -899,6 +1042,8 @@ int main(int argc, char **argv)
 		{ "min-range",    required_argument, NULL, 'm' },
 		{ "max-range",    required_argument, NULL, 'M' },
 		{ "relay",        required_argument, NULL, 'r' },
+		{ "range-image",  required_argument, NULL, 'G' },
+		{ "range-step",   required_argument, NULL, 'K' },
 		{ "ring",         required_argument, NULL, 'o' },
 		{ "zone",         required_argument, NULL, 'z' },
 		{ "action",       required_argument, NULL, 'a' },
@@ -936,7 +1081,7 @@ int main(int argc, char **argv)
 	g.cur_frame = -1;
 	g.last_mid = -1;
 
-	while ((opt = getopt_long(argc, argv, "p:c:C:w:s:b:m:M:r:o:z:a:S:I:E:fh",
+	while ((opt = getopt_long(argc, argv, "p:c:C:w:s:b:m:M:r:o:z:a:S:I:E:G:K:fh",
 				  opts, NULL)) != -1) {
 		switch (opt) {
 		case 'p': g.listen_port = atoi(optarg); break;
@@ -961,6 +1106,13 @@ int main(int argc, char **argv)
 			break;
 		case 'm': g.min_range_mm = (uint32_t)(atof(optarg) * 1000.0); break;
 		case 'M': g.max_range_mm = (uint32_t)(atof(optarg) * 1000.0); break;
+		case 'G':
+			g.rimg_path = optarg;
+			g.range_image = true;
+			break;
+		case 'K':
+			g.rimg_step = atoi(optarg);
+			break;
 		case 'r':
 			if (!parse_hostport(optarg, &g.relay_to, 7502)) {
 				fprintf(stderr, "bad --relay '%s'\n", optarg);
@@ -1090,6 +1242,33 @@ int main(int argc, char **argv)
 	}
 
 	zones_index();
+	if (g.range_image) {
+		size_t n;
+
+		if (g.rimg_step < 1)
+			g.rimg_step = 1;
+		g.rimg_rows = (g.channels + g.rimg_step - 1) / g.rimg_step;
+		n = (size_t)g.rimg_rows * g.sectors;
+
+		g.rimg = calloc(n, sizeof(*g.rimg));
+		g.rimg_pub = calloc(n, sizeof(*g.rimg_pub));
+		if (!g.rimg || !g.rimg_pub) {
+			/* Not fatal: the ring and the relay are what this daemon
+			 * is for, and losing the depth view is better than not
+			 * starting. */
+			free(g.rimg);
+			free(g.rimg_pub);
+			g.rimg = g.rimg_pub = NULL;
+			g.range_image = false;
+			logmsg(LOG_WARNING, "no memory for a %dx%d range image",
+			       g.rimg_rows, g.sectors);
+		} else {
+			logmsg(LOG_NOTICE,
+			       "range image %dx%d (every %d of %d channels) to %s",
+			       g.rimg_rows, g.sectors, g.rimg_step, g.channels,
+			       g.rimg_path);
+		}
+	}
 	ring_reset();
 	logmsg(LOG_NOTICE, "listening on :%d, %d ch x %d col, %d sectors, %d zones",
 	       g.listen_port, g.channels, g.columns, g.sectors, g.nzones);

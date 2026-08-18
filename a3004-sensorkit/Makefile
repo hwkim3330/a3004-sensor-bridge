@@ -59,6 +59,7 @@ define Package/a3004-sensorkit/install
 	$(LN) /var/run/slam2d.json $(1)/www/sensors/slam2d.json
 	$(LN) /var/run/navigate.json $(1)/www/sensors/navigate.json
 	$(LN) /var/run/map.s2mp $(1)/www/sensors/map.s2mp
+	$(LN) /var/run/range.bin $(1)/www/sensors/range.bin
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/sensor-probe $(1)/usr/sbin/sensor-probe

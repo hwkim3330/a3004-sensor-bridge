@@ -46,6 +46,8 @@ start_service() {
 	config_get ring          lidar ring
 	config_get status_interval lidar status_interval 200
 	config_get action        lidar action
+	config_get_bool range_image lidar range_image 1
+	config_get range_step    lidar range_step 2
 
 	# Make the sensor what this router expects, before reading back what it
 	# says. Its configuration does not survive its own reboot, and a wrong one
@@ -158,6 +160,12 @@ start_service() {
 	[ -n "$az_window" ] && procd_append_param command --azimuth-window "$az_window"
 	[ -n "$channel_band" ] && procd_append_param command --channel-band "$channel_band"
 	[ -n "$relay" ] && procd_append_param command --relay "$relay"
+	# /var/run so it lands in tmpfs, and symlinked into /www/sensors by the
+	# dashboard package like the status file and the map.
+	[ "$range_image" = "1" ] && {
+		procd_append_param command --range-image /var/run/range.bin
+		procd_append_param command --range-step "$range_step"
+	}
 	# One --ring per destination. A list here rather than a single value
 	# because the on-router mapper and the operator's screen both want it, and
 	# with one destination choosing either silently blanks the other.
