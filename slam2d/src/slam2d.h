@@ -154,4 +154,18 @@ bool s2_map_write_pgm(const struct s2_map *m, const char *path);
 bool s2_map_write_export(const struct s2_map *m, const struct s2_pose *p,
 			 int level, const char *path);
 
+/*
+ * Read a map back in, so a survey can be reused instead of rebuilt.
+ *
+ * Only level 0 is stored; the pyramid is derived, so loading rebuilds it rather
+ * than trusting a file to be self-consistent. The geometry in the file has to
+ * match the map it is being loaded into - resolution and size - because a map
+ * whose cells mean a different distance than the caller thinks is worse than no
+ * map at all. Mismatches are refused rather than resampled.
+ *
+ * `p` receives the pose stored with the map, which is where the vehicle was when
+ * it was saved. A caller that knows better should ignore it.
+ */
+bool s2_map_read_export(struct s2_map *m, struct s2_pose *p, const char *path);
+
 #endif /* SLAM2D_H */

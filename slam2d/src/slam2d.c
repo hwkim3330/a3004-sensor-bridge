@@ -638,6 +638,63 @@ bool s2_map_write_export(const struct s2_map *m, const struct s2_pose *p,
 	return rename(tmp, path) == 0;
 }
 
+bool s2_map_read_export(struct s2_map *m, struct s2_pose *p, const char *path)
+{
+	uint8_t hdr[32];
+	FILE *f;
+	int32_t w, h, res, ox, oy;
+	size_t n;
+
+	f = fopen(path, "rb");
+	if (!f)
+		return false;
+	if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+	    memcmp(hdr, "S2MP", 4) || hdr[4] != 1) {
+		fclose(f);
+		return false;
+	}
+	/* Only a level-0 file can be loaded: a downsampled one has lost the
+	 * detail the matcher works at, and silently accepting it would give a
+	 * map that looks right and matches badly. */
+	if (hdr[5] != 0) {
+		fclose(f);
+		return false;
+	}
+	w = (int32_t)(hdr[6] | (hdr[7] << 8));
+	h = (int32_t)(hdr[8] | (hdr[9] << 8));
+	res = (int32_t)(hdr[10] | (hdr[11] << 8));
+	ox = (int32_t)((uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) |
+		       ((uint32_t)hdr[14] << 16) | ((uint32_t)hdr[15] << 24));
+	oy = (int32_t)((uint32_t)hdr[16] | ((uint32_t)hdr[17] << 8) |
+		       ((uint32_t)hdr[18] << 16) | ((uint32_t)hdr[19] << 24));
+
+	if (w != m->w[0] || h != m->h[0] || res != m->res_cm) {
+		fclose(f);
+		return false;
+	}
+
+	n = (size_t)w * h;
+	if (fread(m->cell[0], 1, n, f) != n) {
+		fclose(f);
+		return false;
+	}
+	fclose(f);
+
+	m->origin_x_cm = ox;
+	m->origin_y_cm = oy;
+	if (p) {
+		p->x_cm = (int32_t)((uint32_t)hdr[20] | ((uint32_t)hdr[21] << 8) |
+				    ((uint32_t)hdr[22] << 16) | ((uint32_t)hdr[23] << 24));
+		p->y_cm = (int32_t)((uint32_t)hdr[24] | ((uint32_t)hdr[25] << 8) |
+				    ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[27] << 24));
+		p->a = (int32_t)((uint32_t)hdr[28] | ((uint32_t)hdr[29] << 8) |
+				 ((uint32_t)hdr[30] << 16) | ((uint32_t)hdr[31] << 24));
+	}
+	m->dirty = true;
+	s2_map_build_pyramid(m);
+	return true;
+}
+
 bool s2_map_write_pgm(const struct s2_map *m, const char *path)
 {
 	FILE *f = fopen(path, "wb");

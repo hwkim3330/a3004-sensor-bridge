@@ -151,6 +151,20 @@ static struct {
 	int32_t *queue;
 	int32_t goal_x_cm, goal_y_cm;
 	bool have_goal;
+	/*
+	 * A route is a list of goals driven in order, not a different mode.
+	 *
+	 * Everything that makes a single goal safe - the plan check, the stall
+	 * timer, the ring timeout, the score floor - applies per leg, because a
+	 * leg *is* a goal. All this adds is what to do on arrival: take the next
+	 * one instead of stopping. A route that skipped those checks between legs
+	 * would be a second, weaker controller wearing the same name.
+	 */
+#define MAX_WAYPOINTS 24
+	int32_t wp_x_cm[MAX_WAYPOINTS];
+	int32_t wp_y_cm[MAX_WAYPOINTS];
+	int nwp;			/* 0 when driving to a single goal */
+	int wp_at;			/* which leg is being driven */
 
 	enum state state;
 	const char *fault;
@@ -161,6 +175,18 @@ static struct {
 	bool have_last_frame;
 	int32_t last_score_pct;
 	int32_t last_remaining_cm, best_remaining_cm;
+	/*
+	 * Turning is progress too.
+	 *
+	 * The stall watcher measured only remaining distance, so a vehicle doing
+	 * exactly the right thing - rotating in place to face a destination behind
+	 * it - looked stuck. A goal 225 degrees away takes about eight seconds to
+	 * turn towards at the default yaw ceiling, which is the stall window, so a
+	 * goal behind the vehicle was refused with "no progress towards the goal"
+	 * having never moved. Found by adding routes: the second leg of a tour
+	 * often faces backwards.
+	 */
+	int32_t best_err;
 	uint64_t last_ring_ms, last_progress_ms;
 	bool zone_alarm;
 } g;
@@ -612,6 +638,21 @@ static void control_step(void)
 		g.best_remaining_cm = remaining;
 		g.last_progress_ms = t;
 	}
+	{
+		/* Alignment counts as progress, with a margin so noise in the
+		 * matched pose cannot hold the timer open for ever. 64/4096 of a
+		 * turn is about 5.6 degrees. */
+		int32_t want_now = s2_atan2(g.goal_y_cm - g.pose.y_cm,
+					    g.goal_x_cm - g.pose.x_cm);
+		int32_t e = s2_angle_diff(want_now, g.pose.a);
+
+		if (e < 0)
+			e = -e;
+		if (e < g.best_err - 64) {
+			g.best_err = e;
+			g.last_progress_ms = t;
+		}
+	}
 	if (t - g.last_progress_ms > (uint64_t)g.stall_ms) {
 		halt(ST_BLOCKED_FAULT, "no progress towards the goal");
 		return;
@@ -622,6 +663,36 @@ static void control_step(void)
 		int32_t dy = g.goal_y_cm - g.pose.y_cm;
 
 		if (dx * dx + dy * dy <= g.arrive_cm * g.arrive_cm) {
+			if (g.nwp && g.wp_at + 1 < g.nwp) {
+				/* Next leg. The plan is re-checked for it exactly
+				 * as it would be for a fresh goal, so a route
+				 * cannot walk into something a single goal would
+				 * have refused. */
+				g.wp_at++;
+				g.goal_x_cm = g.wp_x_cm[g.wp_at];
+				g.goal_y_cm = g.wp_y_cm[g.wp_at];
+				g.best_remaining_cm = 0x7FFFFFFF;
+				g.best_err = S2_TURN;
+				g.last_progress_ms = now_ms();
+				{
+					enum plan_fail f = plan_reason();
+
+					if (f != PLAN_OK) {
+						static const char *why;
+
+						why = plan_fail_text(f);
+						g.have_goal = false;
+						g.nwp = 0;
+						halt(ST_BLOCKED_FAULT, why);
+						return;
+					}
+				}
+				logmsg(LOG_NOTICE, "leg %d/%d: %d,%d cm",
+				       g.wp_at + 1, g.nwp,
+				       (int)g.goal_x_cm, (int)g.goal_y_cm);
+				return;
+			}
+			g.nwp = 0;
 			halt(ST_ARRIVED, "goal reached");
 			return;
 		}
@@ -755,8 +826,10 @@ static void handle_cmd(char *line)
 	    sscanf(line + 4, "%d %d", &x, &y) == 2) {
 		g.goal_x_cm = x;
 		g.goal_y_cm = y;
+		g.nwp = 0;		/* a bare goal replaces a route rather than joining it */
 		g.have_goal = true;
 		g.best_remaining_cm = 0x7FFFFFFF;
+		g.best_err = S2_TURN;
 		g.last_progress_ms = now_ms();
 		g.fault = NULL;
 		{
@@ -775,8 +848,53 @@ static void handle_cmd(char *line)
 		}
 		g.state = ST_DRIVING;
 		logmsg(LOG_NOTICE, "goal set to %d,%d cm", (int)x, (int)y);
+	} else if (!strncmp(line, "ROUTE", 5)) {
+		const char *p = line + 5;
+		int n = 0;
+
+		while (n < MAX_WAYPOINTS) {
+			int32_t wx, wy;
+			int used = 0;
+
+			if (sscanf(p, "%d %d%n", &wx, &wy, &used) != 2)
+				break;
+			g.wp_x_cm[n] = wx;
+			g.wp_y_cm[n] = wy;
+			n++;
+			p += used;
+		}
+		if (n == 0) {
+			logmsg(LOG_WARNING, "ROUTE with no usable waypoints");
+			return;
+		}
+		g.nwp = n;
+		g.wp_at = 0;
+		g.goal_x_cm = g.wp_x_cm[0];
+		g.goal_y_cm = g.wp_y_cm[0];
+		g.have_goal = true;
+		g.best_remaining_cm = 0x7FFFFFFF;
+		g.best_err = S2_TURN;
+		g.last_progress_ms = now_ms();
+		g.fault = NULL;
+		{
+			enum plan_fail f = plan_reason();
+
+			if (f != PLAN_OK) {
+				static const char *why;
+
+				why = plan_fail_text(f);
+				g.have_goal = false;
+				g.nwp = 0;
+				halt(ST_BLOCKED_FAULT, why);
+				return;
+			}
+		}
+		g.state = ST_DRIVING;
+		logmsg(LOG_NOTICE, "route of %d legs, first %d,%d cm",
+		       n, (int)g.goal_x_cm, (int)g.goal_y_cm);
 	} else if (!strncmp(line, "STOP", 4) || !strncmp(line, "CLEAR", 5)) {
 		g.have_goal = false;
+		g.nwp = 0;
 		g.state = ST_IDLE;
 		g.fault = NULL;
 		halt(ST_IDLE, "stopped by request");
@@ -802,6 +920,9 @@ static void status_write(void)
 		"\t\"fault\": %s%s%s,\n"
 		"\t\"pose_cm\": {\"x\": %d, \"y\": %d, \"a\": %d},\n"
 		"\t\"goal_cm\": {\"x\": %d, \"y\": %d, \"set\": %s},\n"
+		/* Which leg of a route, so a client can show progress along it
+		 * rather than only the leg being driven. Zeros for a single goal. */
+		"\t\"route\": {\"legs\": %d, \"leg\": %d},\n"
 		"\t\"remaining_cm\": %d,\n"
 		"\t\"match_score_pct\": %d,\n"
 		"\t\"zone_alarm\": %s,\n"
@@ -818,6 +939,7 @@ static void status_write(void)
 		(int)g.pose.x_cm, (int)g.pose.y_cm, (int)g.pose.a,
 		(int)g.goal_x_cm, (int)g.goal_y_cm,
 		g.have_goal ? "true" : "false",
+		g.nwp, g.nwp ? g.wp_at + 1 : 0,
 		(int)g.last_remaining_cm, (int)g.last_score_pct,
 		g.zone_alarm ? "true" : "false",
 		(unsigned long long)g.rings, (unsigned long long)g.matched,

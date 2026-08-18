@@ -55,6 +55,17 @@ static struct {
 	char *status_path;
 	char *map_path;
 	char *map_export;
+	/*
+	 * A survey is worth keeping.
+	 *
+	 * The exported map lives in /var/run, which is tmpfs - so every reboot
+	 * threw away the building and started matching against an empty grid.
+	 * --map-load seeds the grid from a file at start, and the command port
+	 * lets a client ask for the current map to be written somewhere
+	 * persistent while the daemon keeps running.
+	 */
+	char *map_load;
+	int cmd_port;
 	int map_level;
 	int status_ms;
 	int map_ms;
@@ -288,6 +299,14 @@ static const char usage[] =
 "  -I, --status-interval MS  how often to write it (default 500)\n"
 "  -M, --map PATH         periodically write the map as a PGM\n"
 "  -T, --map-interval MS  how often to write it (default 5000)\n"
+"  -O, --map-load PATH    seed the grid from a saved map at start. The file must\n"
+"                         match this map's size and resolution and be level 0;\n"
+"                         a mismatch is refused rather than resampled, because\n"
+"                         a map whose cells mean a different distance matches\n"
+"                         confidently and wrongly\n"
+"  -C, --cmd-port PORT    accept 'SAVE <path>' and 'RESET' here. /var/run is\n"
+"                         tmpfs, so a survey has to be written somewhere that\n"
+"                         survives a reboot; SAVE always writes level 0\n"
 "  -X, --map-export PATH  map, geometry and pose in one file for a client\n"
 "  -L, --map-level N      which pyramid level to export (default 2, 20 cm)\n"
 "  -f, --foreground       log to stderr\n"
@@ -312,6 +331,8 @@ int main(int argc, char **argv)
 		{ "map",             required_argument, NULL, 'M' },
 		{ "map-interval",    required_argument, NULL, 'T' },
 		{ "map-export",      required_argument, NULL, 'X' },
+		{ "map-load",        required_argument, NULL, 'O' },
+		{ "cmd-port",        required_argument, NULL, 'C' },
 		{ "map-level",       required_argument, NULL, 'L' },
 		{ "foreground",      no_argument,       NULL, 'f' },
 		{ "help",            no_argument,       NULL, 'h' },
@@ -321,6 +342,7 @@ int main(int argc, char **argv)
 	struct sigaction sa;
 	uint64_t last_status = 0, last_map = 0;
 	int sock, c;
+	int csock = -1;
 
 	g.port = 7602;
 	g.map_cm = 4000;
@@ -334,7 +356,7 @@ int main(int argc, char **argv)
 	g.map_ms = 5000;
 	g.map_level = 2;
 
-	while ((c = getopt_long(argc, argv, "p:m:r:R:w:a:n:S:I:M:T:X:L:fh", opts,
+	while ((c = getopt_long(argc, argv, "p:m:r:R:w:a:n:S:I:M:T:X:L:fhO:C:", opts,
 				NULL)) != -1) {
 		switch (c) {
 		case 'p': g.port = atoi(optarg); break;
@@ -349,6 +371,8 @@ int main(int argc, char **argv)
 		case 'M': g.map_path = optarg; break;
 		case 'T': g.map_ms = atoi(optarg); break;
 		case 'X': g.map_export = optarg; break;
+		case 'O': g.map_load = optarg; break;
+		case 'C': g.cmd_port = atoi(optarg); break;
 		case 'L': g.map_level = atoi(optarg); break;
 		case 'f': g.foreground = true; break;
 		case 'h': fputs(usage, stdout); return 0;
@@ -363,6 +387,27 @@ int main(int argc, char **argv)
 		logmsg(LOG_ERR, "map %d cm at %d cm per cell: out of memory",
 		       (int)g.map_cm, (int)g.res_cm);
 		return 1;
+	}
+
+	if (g.map_load) {
+		struct s2_pose saved;
+
+		if (s2_map_read_export(&g.map, &saved, g.map_load)) {
+			logmsg(LOG_NOTICE, "loaded %s: pose %d,%d cm a=%d",
+			       g.map_load, (int)saved.x_cm, (int)saved.y_cm,
+			       (int)saved.a);
+			/* The stored pose is where the vehicle was when the map
+			 * was saved, which is not where it is now. Matching
+			 * starts from it because it is a better guess than the
+			 * origin, and the first scan corrects it. */
+			g.pose = saved;
+		} else {
+			/* Not fatal. A map that will not load is a map that
+			 * would have been matched against wrongly. */
+			logmsg(LOG_WARNING,
+			       "cannot load %s (wrong size, resolution or level)",
+			       g.map_load);
+		}
 	}
 	logmsg(LOG_NOTICE,
 	       "map %dx%d cells at %d cm (%ld kB), search +/-%d cm and +/-%d deg",
@@ -397,17 +442,78 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 
+	if (g.cmd_port > 0) {
+		struct sockaddr_in ca;
+
+		csock = socket(AF_INET, SOCK_DGRAM, 0);
+		if (csock >= 0) {
+			int one = 1;
+
+			setsockopt(csock, SOL_SOCKET, SO_REUSEADDR, &one,
+				   sizeof(one));
+			memset(&ca, 0, sizeof(ca));
+			ca.sin_family = AF_INET;
+			ca.sin_addr.s_addr = htonl(INADDR_ANY);
+			ca.sin_port = htons((uint16_t)g.cmd_port);
+			if (bind(csock, (struct sockaddr *)&ca, sizeof(ca)) < 0) {
+				logmsg(LOG_WARNING, "cannot bind command port %d: %s",
+				       g.cmd_port, strerror(errno));
+				close(csock);
+				csock = -1;
+			} else {
+				fcntl(csock, F_SETFL,
+				      fcntl(csock, F_GETFL, 0) | O_NONBLOCK);
+				logmsg(LOG_NOTICE, "commands on :%d", g.cmd_port);
+			}
+		}
+	}
+
 	while (!stop_requested) {
-		struct pollfd pfd = { sock, POLLIN, 0 };
+		struct pollfd pfd[2] = { { sock, POLLIN, 0 }, { csock, POLLIN, 0 } };
 		uint8_t buf[65536];
 		ssize_t n;
 		uint64_t t;
 
-		if (poll(&pfd, 1, g.status_ms) < 0 && errno != EINTR)
+		if (poll(pfd, csock >= 0 ? 2 : 1, g.status_ms) < 0 &&
+		    errno != EINTR)
 			break;
 
 		while ((n = recv(sock, buf, sizeof(buf), 0)) > 0)
 			handle_ring(buf, (size_t)n);
+
+		/*
+		 * "SAVE <path>" writes the map where it is asked to, at full
+		 * resolution - a saved survey is for matching against later, so
+		 * it must be level 0 whatever the export level is set to.
+		 * "RESET" starts a fresh grid, which is what you want after
+		 * moving the sensor to a different building.
+		 */
+		while (csock >= 0 &&
+		       (n = recv(csock, buf, sizeof(buf) - 1, 0)) > 0) {
+			buf[n] = 0;
+			if (!strncmp((char *)buf, "SAVE", 4)) {
+				char *path = (char *)buf + 4;
+
+				while (*path == ' ')
+					path++;
+				if (*path && s2_map_write_export(&g.map, &g.pose,
+								 0, path))
+					logmsg(LOG_NOTICE, "map saved to %s", path);
+				else
+					logmsg(LOG_WARNING,
+					       "cannot save map to '%s'", path);
+			} else if (!strncmp((char *)buf, "RESET", 5)) {
+				s2_map_free(&g.map);
+				if (s2_map_init(&g.map, g.map_cm, g.map_cm,
+						g.res_cm)) {
+					g.pose.x_cm = g.pose.y_cm = g.pose.a = 0;
+					logmsg(LOG_NOTICE, "map reset");
+				} else {
+					logmsg(LOG_ERR, "map reset failed");
+					break;
+				}
+			}
+		}
 
 		t = now_ms();
 		if (t - last_status >= (uint64_t)g.status_ms) {

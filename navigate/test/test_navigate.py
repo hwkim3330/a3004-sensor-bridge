@@ -154,6 +154,11 @@ class Sim:
 
     def goal(self, x_cm, y_cm):
         self.out.sendto(f"GOAL {x_cm} {y_cm}".encode(), ("127.0.0.1", CMD_PORT))
+
+    def route(self, *pts):
+        """ROUTE x1 y1 x2 y2 ... in centimetres."""
+        body = " ".join(str(int(v)) for xy in pts for v in xy)
+        self.out.sendto(f"ROUTE {body}".encode(), ("127.0.0.1", CMD_PORT))
         time.sleep(0.3)
 
     def read(self):
@@ -242,6 +247,129 @@ def test_unmapped_goal():
         os.path.exists(status) and os.remove(status)
 
 
+
+def test_route():
+    """A route is legs driven in order, each checked like a single goal.
+
+    The point of the test is not that it reaches the last waypoint - that is the
+    drive test again - but that it *passes through* the first one and that the
+    leg counter says so. A route that quietly drove straight to the final point
+    would pass a "did you arrive" check and be wrong.
+    """
+    print("  driving a route")
+    status = tempfile.mkstemp(suffix=".json")[1]
+    sim = Sim(status)
+    try:
+        warmup(sim)
+        # A tour of open space. The first attempt used (2.5,-1.5) first, which
+        # is on the far side of the wall at x=1 - so leg one grazed the wall end
+        # at 23 cm and leg two needed a 180 degree reversal, and the stall watcher
+        # fired before the turn finished. That says something about the controller
+        # in tight reversals, not about routes, so the route test stays in the
+        # open and the reversal is recorded separately.
+        sim.route((-200, -200), (-200, 200), (0, 200))
+        st = sim.read()
+        check("route accepted", st.get("route", {}).get("legs") == 3,
+              f"route={st.get('route')}")
+        check("starts on the first leg", st.get("route", {}).get("leg") == 1,
+              f"route={st.get('route')}")
+
+        seen_legs = set()
+        # The closest approach, not a flag. A flag needs a failure message to say
+        # anything, and the obvious one - the position at the end of the loop -
+        # is from the wrong moment: by then the vehicle is at the last waypoint,
+        # so the number printed had nothing to do with the check.
+        near_first = 1e9
+        arrived = False
+        for _ in range(900):
+            sim.step()
+            st = sim.read()
+            leg = st.get("route", {}).get("leg", 0)
+            if leg:
+                seen_legs.add(leg)
+            near_first = min(near_first,
+                             math.hypot(sim.x - (-2.0), sim.y - (-2.0)))
+            if st.get("state") == "arrived":
+                arrived = True
+                break
+            if st.get("state") == "stopped":
+                break
+
+        st = sim.read()
+        check("passed through the first waypoint", near_first < 0.45,
+              f"closest approach {near_first:.2f} m, limit 0.45")
+        check("advanced through every leg", seen_legs == {1, 2, 3},
+              f"legs seen: {sorted(seen_legs)}")
+        check("reported arrival at the end", arrived,
+              f"state={st.get('state')} fault={st.get('fault')}")
+        err = math.hypot(sim.x - 0.0, sim.y - 2.0)
+        check("finished within 45 cm of the last waypoint", err < 0.45,
+              f"{err:.2f} m at ({sim.x:.2f}, {sim.y:.2f})")
+        check("never touched a wall", sim.min_clear > 0.25,
+              f"closest approach {sim.min_clear:.2f} m")
+        check("route cleared once finished",
+              sim.read().get("route", {}).get("legs") == 0,
+              f"route={sim.read().get('route')}")
+    finally:
+        sim.close()
+        os.path.exists(status) and os.remove(status)
+
+
+def test_route_refuses_a_bad_leg():
+    """A leg into the unknown must be refused with a reason, like a goal."""
+    print("  a route with an impossible leg")
+    status = tempfile.mkstemp(suffix=".json")[1]
+    sim = Sim(status)
+    try:
+        warmup(sim)
+        sim.route((250, 0), (900000, 900000))
+        for _ in range(400):
+            sim.step()
+            st = sim.read()
+            if st.get("state") in ("stopped", "arrived"):
+                break
+        st = sim.read()
+        check("stopped rather than driving at it", st.get("state") == "stopped",
+              f"state={st.get('state')}")
+        check("said which reason", bool(st.get("fault")),
+              f"fault={st.get('fault')}")
+        check("commanded nothing after stopping", sim.step() is False,
+              "still armed")
+    finally:
+        sim.close()
+        os.path.exists(status) and os.remove(status)
+
+
+def test_goal_behind():
+    """A destination behind the vehicle, with no route involved.
+
+    Isolates the route from the controller: if a single goal that needs a large
+    turn also stalls, the fault is in the turn and not in the sequencing.
+    """
+    print("  a destination behind the vehicle")
+    status = tempfile.mkstemp(suffix=".json")[1]
+    sim = Sim(status)
+    try:
+        warmup(sim)
+        sim.goal(-200, -200)                 # roughly 225 degrees away
+        arrived = False
+        for _ in range(600):
+            sim.step()
+            st = sim.read()
+            if st.get("state") == "arrived":
+                arrived = True
+                break
+            if st.get("state") == "stopped":
+                break
+        st = sim.read()
+        moved = math.hypot(sim.x, sim.y)
+        check("moved at all", moved > 0.30, f"{moved:.2f} m from the start")
+        check("arrived", arrived,
+              f"state={st.get('state')} fault={st.get('fault')}")
+    finally:
+        sim.close()
+        os.path.exists(status) and os.remove(status)
+
 def test_watchers():
     print("\n  the watchers")
     for name, kick in (("zone alarm", "zone"), ("ring loss", "silence")):
@@ -278,6 +406,9 @@ def test_watchers():
 print(f"navigate closed-loop verification using {BIN}\n")
 test_drive()
 test_unmapped_goal()
+test_goal_behind()
+test_route()
+test_route_refuses_a_bad_leg()
 test_watchers()
 
 print()

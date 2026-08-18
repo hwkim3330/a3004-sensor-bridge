@@ -25,6 +25,8 @@ start_service() {
 	config_get mexp         map map_export
 	config_get mlvl         map map_level        2
 	config_get mint         map map_interval   5000
+	config_get cport        map cmd_port       7605
+	config_get mload        map map_load
 
 	# A ring that is a minimum over every beam maps the floor, not the room.
 	# Cannot be checked from here - the ring carries ranges, not which
@@ -41,6 +43,12 @@ start_service() {
 		-w "$win" -a "$wina" -n "$minret" -I "$sint"
 	[ -n "$mpath" ] && procd_append_param command -M "$mpath" -T "$mint"
 	[ -n "$mexp" ] && procd_append_param command -X "$mexp" -L "$mlvl"
+	[ -n "$cport" ] && procd_append_param command -C "$cport"
+	# Only when it is actually there: a path that does not exist yet would log a
+	# refusal on every boot before the first map has ever been saved.
+	mkdir -p /etc/keti/maps
+	[ -n "$mload" ] && [ -f "$mload" ] && \
+		procd_append_param command -O "$mload"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1
