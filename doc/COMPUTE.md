@@ -113,6 +113,33 @@ Check the Ethernet port count on whichever is chosen before committing. Full
 rate wants a port to itself; sharing one with the router uplink puts 126 Mbit/s
 of unpaced UDP next to everything else.
 
+## Changing the sensor profile invalidates the pose
+
+Measured 2026-08-18. After a session that switched the sensor between
+`RNG19_RFL8_SIG16_NIR16` and `RNG15_RFL8_NIR8` and restarted `ouster-edge`
+several times, `slam2d` was reporting a pose of **-3.70 m, 0.85 m and 279
+degrees** for a sensor that had not moved. Restarted, it came back to 0, 0 and
+-0.3 degrees, and then held:
+
+| elapsed | pose | heading | match |
+|---|---|---|---|
+| 15 s | 0, 0 cm | 4091 | 86 % |
+| 45 s | 0, 0 cm | 4088 | 83 % |
+| 90 s | 0, 0 cm | 4092 | 75 % |
+
+So there is no drift while stationary - position stays at zero to the centimetre
+and heading inside ±0.35 degrees over 1104 revolutions. The 279 degrees came from
+the disturbances, not from time passing. A profile change alters what the ring
+looks like and a restart breaks the stream; either lets the matcher slip once,
+and a slip is permanent because nothing brings it back.
+
+**Restart slam2d after changing anything about the sensor.**
+
+The part worth remembering is that the match score did not report the problem.
+It read 78-89 % throughout, which is healthy, while the pose was 3.7 m and most
+of a turn wrong. Score answers "does this scan fit the map I have", not "is the
+map where the room is" - so the score being fine is not evidence the pose is.
+
 ## 3D over WiFi: fragments, not bandwidth
 
 Measured 2026-08-18 with a MediaTek MT7610U on the PC and the OS-1-64 relayed
