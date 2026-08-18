@@ -113,6 +113,41 @@ Check the Ethernet port count on whichever is chosen before committing. Full
 rate wants a port to itself; sharing one with the router uplink puts 126 Mbit/s
 of unpaced UDP next to everything else.
 
+## 3D over WiFi: fragments, not bandwidth
+
+Measured 2026-08-18 with a MediaTek MT7610U on the PC and the OS-1-64 relayed
+from the router.
+
+The raw stream would not go over WiFi, and the reason was not the one the
+numbers suggest:
+
+| profile | datagram | IP fragments | 802.11 frames/s | arrived over WiFi |
+|---|---|---|---|---|
+| `RNG19_RFL8_SIG16_NIR16` | 12544 B | 9 | ~5760 | **58-60 %** |
+| `RNG15_RFL8_NIR8` | 4352 B | 3 | ~1920 | **99 %** |
+
+2.4 GHz gave 58 % and 5 GHz gave 60 %. A band that carries five times the bits
+made almost no difference, which is the whole finding: the limit is the *frame
+rate*, not the bit rate. A 12544-byte datagram is nine fragments at a 1500-byte
+MTU and losing any one of them loses the whole datagram, so the failure is
+multiplied rather than graceful.
+
+The loss was on the router's own send side rather than in the air - it received
+641 packets/s with `missed_columns` at 0 and relayed only 366/s. `relayed`
+against `packets` in `/var/run/ouster-edge.json` is the number that says so, and
+it is worth checking before blaming the link.
+
+At the low-rate profile the same path carries 632 of 640 packets/s, 2.62 MB/s.
+What is given up is range precision (RNG15 rather than RNG19) and the signal and
+reflectivity channels - not scans, and not columns.
+
+So: **wired for the full-precision 3D stream, wireless for the low-rate one.**
+The ring is unaffected either way at 10 Hz and 11 kB/s.
+
+One unexplained thing: the 5 GHz AP was invisible to that card on channels 36,
+44 and 149, and appeared on 40. VHT80 is also out of range for the KR regdomain
+here (5150-5230 @ 40), so it now runs VHT40.
+
 ## And the router's own cores
 
 Worth stating because "MT7621 is dual core" invites the wrong expectation.
