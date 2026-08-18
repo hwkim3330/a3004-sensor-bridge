@@ -41,6 +41,7 @@ TELEOP_PORT = 7721      # teleop, TCMD 24 B - operator intent
 NAV_PORT = 7604         # navigate, "GOAL x y" / "ROUTE ..." / "STOP"
 MAP_PORT = 7605         # slam2d, "SAVE path" / "LOAD path" / "RESET"
 CAM_PORT = 8080
+MIC_PORT = 8082
 TELE_HZ = 50
 # Shorter than teleop's own 300 ms, so the browser going quiet is caught here
 # first and the frames stop being armed rather than stopping altogether. Both
@@ -105,6 +106,88 @@ class Camera:
                         in_frame = False
                         acc = bytearray()
                 prev = b
+
+
+class Mic:
+    """One upstream PCM reader, fanned out to browsers, plus an envelope.
+
+    Charged per client the same way the camera is - mic-stream reported a client
+    count and a byte total, and it is sending the whole stream to each one - so
+    this pulls it once. Five browsers listening cost the router what one does.
+
+    Two products from one read: the raw S16 for anything that wants to hear it,
+    and one peak per buffer for the waveform. The envelope is computed here rather
+    than in each browser because it is the same answer for everyone and it is a
+    tenth of the bytes.
+
+    Slow listeners are dropped from, not waited for. A browser that cannot keep up
+    with 32 kB/s has a problem that queueing audio at it will not fix, and the
+    queue would be latency on a signal whose only value is being current.
+    """
+
+    LEVELS = 240
+
+    def __init__(self, base):
+        self.base = base
+        self.rate = 16000
+        self.channels = 1
+        self.state = "off"
+        self.levels = [0.0] * self.LEVELS
+        self.head = 0
+        self.listeners = set()          # ws responses wanting raw pcm
+        self.bytes = 0
+
+    async def run(self):
+        while True:
+            try:
+                async with ClientSession(timeout=ClientTimeout(total=8)) as s:
+                    async with s.get(f"{self.base}/info") as r:
+                        info = json.loads(await r.text())
+                self.rate = int(info.get("rate", 16000))
+                self.channels = int(info.get("channels", 1))
+                self.state = f"{self.rate // 1000} kHz"
+                timeout = ClientTimeout(total=None, sock_read=8)
+                async with ClientSession(timeout=timeout) as s:
+                    async with s.get(f"{self.base}/pcm") as r:
+                        await self._read(r)
+            except Exception as e:
+                self.state = f"no mic ({type(e).__name__})"
+            await asyncio.sleep(1.5)
+
+    async def _read(self, r):
+        import array
+        while True:
+            chunk = await r.content.read(1024)
+            if not chunk:
+                return
+            self.bytes += len(chunk)
+            n = len(chunk) // 2 * 2
+            if n:
+                a = array.array("h")
+                a.frombytes(chunk[:n])
+                peak = max(abs(v) for v in a) / 32768.0
+                self.levels[self.head % self.LEVELS] = peak
+                self.head += 1
+            if self.listeners:
+                dead = []
+                for ws in self.listeners:
+                    try:
+                        # No await on a full transport: send_bytes on an aiohttp
+                        # ws buffers, so a stalled browser grows memory here. The
+                        # drop is the point.
+                        if ws.closed:
+                            dead.append(ws)
+                        else:
+                            await ws.send_bytes(chunk)
+                    except Exception:
+                        dead.append(ws)
+                for ws in dead:
+                    self.listeners.discard(ws)
+
+    def envelope(self):
+        """Oldest to newest, so a browser can draw it left to right."""
+        h = self.head % self.LEVELS
+        return [round(v, 4) for v in (self.levels[h:] + self.levels[:h])]
 
 
 class Ring:
@@ -355,16 +438,47 @@ async def status_poller(app):
     st = app["state"]
     host = app["host"]
     names = ("ouster", "slam2d", "navigate", "can", "teleop")
+    #
+    # A status file outliving its daemon is the trap here.
+    #
+    # /var/run/*.json is written by each daemon and is *not* removed when it
+    # stops, so "the file is there" says nothing about whether anything is
+    # running. This console asserted otherwise and showed a live steering UI with
+    # teleop stopped - the frames went to a port with nothing bound to it and the
+    # page looked exactly as it does when it works.
+    #
+    # What does distinguish them is that a running daemon rewrites its file
+    # constantly. Measured on all four: six polls over 3.6 seconds give six
+    # different contents even with nothing happening, because each carries a
+    # counter or an age. So a file whose bytes have not changed for a few seconds
+    # belongs to a daemon that is gone.
+    #
+    seen = {}          # name -> (text, monotonic time it last changed)
     async with ClientSession(timeout=ClientTimeout(total=3)) as s:
         while True:
-            out = {}
+            out, fresh = {}, {}
+            now = time.monotonic()
             for n in names:
+                text = None
                 try:
                     async with s.get(f"http://{host}/sensors/{n}.json") as r:
-                        out[n] = json.loads(await r.text())
+                        text = await r.text()
+                        out[n] = json.loads(text)
                 except Exception:
                     out[n] = None
+                if text is None:
+                    seen.pop(n, None)
+                    fresh[n] = False
+                    continue
+                prev = seen.get(n)
+                if prev is None or prev[0] != text:
+                    seen[n] = (text, now)
+                fresh[n] = (now - seen[n][1]) < 3.0
+                if not fresh[n]:
+                    # Present but frozen: the daemon that wrote it is not running.
+                    out[n] = None
             st["status"] = out
+            st["fresh"] = fresh
             try:
                 async with s.get(f"http://{host}/sensors/map.s2mp") as r:
                     st["map"] = await r.read()
@@ -410,12 +524,33 @@ async def mapfile(request):
     return web.Response(body=b, content_type="application/octet-stream")
 
 
+async def audio_handler(request):
+    """Raw S16 mono frames, for a browser that has been asked to make a sound.
+
+    A socket of its own rather than binary frames on the telemetry socket: a
+    viewer that is not listening should not be sent 32 kB/s, and the two have
+    nothing to say to each other.
+    """
+    ws = web.WebSocketResponse(max_msg_size=0)
+    await ws.prepare(request)
+    mic = request.app["mic"]
+    await ws.send_json({"rate": mic.rate, "channels": mic.channels})
+    mic.listeners.add(ws)
+    try:
+        async for _ in ws:
+            pass
+    finally:
+        mic.listeners.discard(ws)
+    return ws
+
+
 async def ws_handler(request):
     ws = web.WebSocketResponse(heartbeat=5)
     await ws.prepare(request)
     app = request.app
     drv = app["drv"]
     rec = app["rec"]
+    mic = app["mic"]
     host = app["host"]
 
     async def telemetry():
@@ -426,7 +561,11 @@ async def ws_handler(request):
                 "ring": {"cm": ring.cm, "frame": ring.frame, "dups": ring.dups,
                          "age": round(time.time() - ring.at, 2) if ring.at else None},
                 "status": app["state"].get("status", {}),
+                "fresh": app["state"].get("fresh", {}),
                 "cam": {"state": app["cam"].state, "frames": app["cam"].arrived},
+                "mic": {"state": mic.state, "rate": mic.rate,
+                        "listeners": len(mic.listeners),
+                        "env": mic.envelope()},
                 "drive": {"mine": drv.owner is ws, "held": drv.owner is not None,
                           "armed": drv.armed, "sent": drv.sent,
                           "lapsed": drv.lapsed,
@@ -497,6 +636,7 @@ async def on_start(app):
     app["ring"].on_ring = lambda cm: app["rec"].add(cm, app["drv"], _pose())
     app["state"]["tasks"] = [
         asyncio.create_task(app["cam"].run()),
+        asyncio.create_task(app["mic"].run()),
         asyncio.create_task(app["drv"].run()),
         asyncio.create_task(status_poller(app)),
     ]
@@ -527,6 +667,7 @@ def main():
     app["host"] = a.host
     app["static"] = pathlib.Path(__file__).resolve().parent / "static"
     app["cam"] = Camera(f"http://{a.host}:{CAM_PORT}/stream")
+    app["mic"] = Mic(f"http://{a.host}:{MIC_PORT}")
     app["ring"] = Ring()
     app["drv"] = Driver(a.host)
     app["state"] = {"status": {}}
@@ -535,6 +676,7 @@ def main():
     app.router.add_get("/camera.mjpg", camera)
     app.router.add_get("/map.s2mp", mapfile)
     app.router.add_get("/ws", ws_handler)
+    app.router.add_get("/audio", audio_handler)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
 

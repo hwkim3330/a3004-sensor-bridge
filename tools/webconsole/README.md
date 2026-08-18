@@ -77,9 +77,42 @@ cells, not by everything known: the map carries isolated stray returns scattered
 right across it, and one of those in a far corner puts the full 20 m back on
 screen. Free cells only exist along rays that were actually traced.
 
+## Saying when a control does nothing
+
+`teleop`, `navigate`, `agx-cmd` and `can-bridge` are all off by default on the
+router, and for a while this page showed a complete steering UI with `teleop`
+stopped: the frames went to a port with nothing bound to them, and the console
+looked exactly as it does when everything works.
+
+The first fix was wrong in an instructive way. It tested whether the status file
+existed — and `/var/run/*.json` is written by each daemon and **not** removed when
+it stops, so a stopped `teleop` still looked present. What actually distinguishes
+them is that a running daemon rewrites its file constantly: measured on all four,
+six polls over 3.6 s give six different contents even with nothing happening,
+because each carries a counter or an age. So the server times how long a file's
+bytes have been unchanged and nulls anything frozen for more than three seconds.
+
+A daemon that is gone then disables the controls that depended on it and says so:
+the joystick dims, Arm and Go here grey out, and the banner names the init script.
+There is a second, softer case — `teleop` running but `forwarding` false, because
+`agx-cmd` is off — which is announced without disabling anything, since the
+steering does reach `teleop`, just no further.
+
+## Microphone
+
+One upstream reader, fanned out, the same argument as the camera: `mic-stream`
+charges per client too. Two products come from that read — the raw S16 on `/audio`
+for a browser that wants to hear it, and one peak per buffer in the telemetry for
+the waveform, computed once here rather than in every browser.
+
+`Listen` is a button because an `AudioContext` can only be created from a gesture.
+Playback schedules one `AudioBuffer` per arrival, each starting where the last
+ended, and restarts from the clock if the stream stalls rather than dumping a
+backlog. A listener that cannot keep up is dropped rather than queued for: audio
+whose only value is being current should not be buffered at somebody.
+
 ## Not here yet
 
-- Microphone. `mic-stream` is on 8082 and the tablet plays it; this page does not.
 - 3D. The lidar relay is off by default (it was found sending 64 Mbit/s to a port
   with nothing bound to it, for 1.4 of the board's 4 cores). Turn it on for
   `mapping/capture.py` and friends, and off afterwards.

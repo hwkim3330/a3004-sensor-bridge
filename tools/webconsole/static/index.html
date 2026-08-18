@@ -57,6 +57,9 @@
   </span>
 </div>
 
+<div id="warn" class="card" style="display:none;margin-bottom:12px;
+     border-left:4px solid var(--bad)"></div>
+
 <div class="grid">
   <div class="card">
     <h2>Lidar</h2>
@@ -69,7 +72,15 @@
   </div>
 
   <div class="card">
-    <h2>Status</h2>
+    <div class="row spread" style="margin-bottom:6px">
+      <h2 style="margin:0">Microphone</h2>
+      <span class="row">
+        <span class="keys mono" id="micState">-</span>
+        <button id="listen" class="quiet">Listen</button>
+      </span>
+    </div>
+    <canvas id="wave" width="420" height="90"></canvas>
+    <h2 style="margin:12px 0 8px">Status</h2>
     <div id="stats"></div>
   </div>
 
@@ -98,6 +109,8 @@
         </div>
       </div>
       <div>
+        <canvas id="stick" width="240" height="240"
+                style="touch-action:none;max-width:240px;margin-bottom:8px"></canvas>
         <div class="row" style="margin-bottom:10px">
           <button id="take" class="on">Take control</button>
           <button id="go" class="quiet" disabled>Go here</button>
@@ -112,6 +125,7 @@
           the keys, or of the tab, brings the vehicle to neutral.
         </div>
         <div class="keys mono" id="driveInfo" style="margin-top:8px">&nbsp;</div>
+        <div class="keys mono" id="epInfo" style="margin-top:4px">&nbsp;</div>
       </div>
     </div>
   </div>
@@ -122,6 +136,10 @@ const S2_UNKNOWN = 128, S2_TURN = 4096;
 let ws, tele = {}, mine = false, armed = false, floor = 1;
 let waypoints = [], mapData = null;
 const keys = new Set();
+// Touch intent, kept apart from the keys so a stick release cannot be mistaken
+// for a key still being held.
+let stick = null;   // {x, y} in [-1, 1], or null when nothing is touching it
+let audio = null;
 
 // ---------------------------------------------------------------- transport
 function connect() {
@@ -149,9 +167,16 @@ function setLink(text, cls) {
 setInterval(() => {
   if (!mine) return;
   const slow = keys.has("Shift") ? 0.35 : 1;
-  let y = (keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0);
-  let x = (keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0);
-  let r = (keys.has("q") ? 1 : 0) - (keys.has("e") ? 1 : 0);
+  let x, y, r = (keys.has("q") ? 1 : 0) - (keys.has("e") ? 1 : 0);
+  if (stick) {
+    // The stick wins while it is being touched: this console is opened on a
+    // tablet as well as a desk, and a screen with no keyboard needs a way to
+    // drive that is not a key.
+    x = stick.x; y = stick.y;
+  } else {
+    y = (keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0);
+    x = (keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0);
+  }
   send({t: "intent", x: x * slow, y: y * slow, r: r * slow, armed});
 }, 50);
 
@@ -175,6 +200,110 @@ addEventListener("blur", () => { keys.clear(); armed = false; paint(); });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) { keys.clear(); armed = false; paint(); }
 });
+
+// ------------------------------------------------------------------- stick
+const stickCv = document.getElementById("stick");
+function stickFrom(ev) {
+  const rect = stickCv.getBoundingClientRect();
+  const t = ev.touches && ev.touches[0] ? ev.touches[0] : ev;
+  const cx = rect.width / 2, cy = rect.height / 2;
+  let dx = (t.clientX - rect.left - cx) / cx;
+  let dy = -(t.clientY - rect.top - cy) / cy;
+  const d = Math.hypot(dx, dy);
+  if (d > 1) { dx /= d; dy /= d; }        // a round stick, not a square one
+  return {x: dx, y: dy};
+}
+function stickGrab(ev) { ev.preventDefault(); stick = stickFrom(ev); paintStick(); }
+function stickDrop() { stick = null; paintStick(); }
+stickCv.addEventListener("pointerdown", (e) => { stickCv.setPointerCapture(e.pointerId); stickGrab(e); });
+stickCv.addEventListener("pointermove", (e) => { if (stick) stickGrab(e); });
+stickCv.addEventListener("pointerup", stickDrop);
+stickCv.addEventListener("pointercancel", stickDrop);
+// A pointer that leaves the window never sends pointerup here, so releasing
+// outside would leave the stick where it was - held, at full deflection.
+addEventListener("blur", stickDrop);
+
+function paintStick() {
+  const g = stickCv.getContext("2d"), w = stickCv.width, h = stickCv.height;
+  const cx = w / 2, cy = h / 2, rad = Math.min(cx, cy) - 6;
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = "#ececf0";
+  g.beginPath(); g.arc(cx, cy, rad, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = "#dcdce1"; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(cx - rad, cy); g.lineTo(cx + rad, cy);
+  g.moveTo(cx, cy - rad); g.lineTo(cx, cy + rad); g.stroke();
+  const p = stick || {x: 0, y: 0};
+  g.fillStyle = (mine && armed) ? "#007aff" : "#c7c7cc";
+  g.beginPath();
+  g.arc(cx + p.x * rad * 0.82, cy - p.y * rad * 0.82, 26, 0, Math.PI * 2);
+  g.fill();
+  g.fillStyle = "#8a8a8e"; g.font = "11px sans-serif"; g.textAlign = "center";
+  g.fillText("TRANSLATE", cx, h - 2);
+  g.textAlign = "left";
+}
+
+// ------------------------------------------------------------------- audio
+document.getElementById("listen").onclick = async () => {
+  if (audio) {
+    audio.ws.close();
+    await audio.ctx.close();
+    audio = null;
+    document.getElementById("listen").textContent = "Listen";
+    document.getElementById("listen").className = "quiet";
+    return;
+  }
+  // An AudioContext can only be created from a gesture, which is why this is a
+  // button and not something that starts with the page.
+  const ctx = new AudioContext();
+  const ws = new WebSocket(`ws://${location.host}/audio`);
+  ws.binaryType = "arraybuffer";
+  // Scheduled buffers rather than a worklet: 16 kHz mono is small enough that
+  // handing the context one AudioBuffer per arrival, each starting where the last
+  // ended, is both simpler and easier to reason about than a worklet's ring.
+  let at = 0, rate = 16000;
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") { rate = JSON.parse(e.data).rate || 16000; return; }
+    const pcm = new Int16Array(e.data);
+    if (!pcm.length) return;
+    const buf = ctx.createBuffer(1, pcm.length, rate);
+    const f = buf.getChannelData(0);
+    for (let i = 0; i < pcm.length; i++) f[i] = pcm[i] / 32768;
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    // Keep a small lead. If the stream stalls and `at` falls behind the clock,
+    // restart from now rather than dumping the backlog at once.
+    const now = ctx.currentTime;
+    if (at < now + 0.02) at = now + 0.08;
+    src.start(at);
+    at += buf.duration;
+  };
+  audio = {ctx, ws};
+  document.getElementById("listen").textContent = "Mute";
+  document.getElementById("listen").className = "on";
+};
+
+function paintWave() {
+  const cv = document.getElementById("wave"), g = cv.getContext("2d");
+  const w = cv.width, h = cv.height, mid = h / 2;
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = "#e3e3e8"; g.lineWidth = 1;
+  // The centre line is always drawn, so silence and "no microphone" do not look
+  // like the same empty box.
+  g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke();
+  const env = (tele.mic && tele.mic.env) || [];
+  if (!env.length) return;
+  const peak = Math.max(0.02, ...env);
+  g.strokeStyle = "#34c759"; g.lineWidth = 1;
+  const step = w / env.length;
+  for (let i = 0; i < env.length; i++) {
+    const a = (env[i] / peak) * (mid - 3);
+    g.beginPath();
+    g.moveTo(i * step, mid - a); g.lineTo(i * step, mid + a); g.stroke();
+  }
+  g.fillStyle = "#8a8a8e"; g.font = "10px sans-serif";
+  g.fillText(`peak ${env[env.length - 1].toFixed(3)} · scale ${peak.toFixed(3)}`, 2, 10);
+}
 
 // ---------------------------------------------------------------- controls
 document.getElementById("take").onclick = () => send({t: mine ? "release" : "take"});
@@ -229,7 +358,7 @@ function paint() {
   const b = document.getElementById("big");
   b.textContent = armed ? "Stop" : "Arm";
   b.className = armed ? "danger" : "on";
-  b.disabled = !mine;
+
   // From `mine`, the same value the button uses. These were computed separately
   // and disagreed on screen - the header said "nobody driving" beside a Release
   // button and a frame counter that was climbing, because the header was painted
@@ -238,7 +367,6 @@ function paint() {
     mine ? "you are driving"
          : (tele.drive && tele.drive.held) ? "someone else is driving"
          : "nobody driving";
-  document.getElementById("go").disabled = waypoints.length === 0;
   if (tele.drive)
     document.getElementById("driveInfo").textContent =
       `${tele.drive.sent} frames sent, ${tele.drive.lapsed} deadman lapses`;
@@ -247,7 +375,53 @@ function paint() {
     rb.textContent = tele.rec.on ? `Recording ${tele.rec.rows}` : "Record";
     rb.className = tele.rec.on ? "danger" : "quiet";
   }
-  paintStats(); paintRing();
+  paintWarnings();
+  paintStats(); paintRing(); paintWave(); paintStick();
+  if (tele.mic)
+    document.getElementById("micState").textContent =
+      tele.mic.state + (tele.mic.listeners ? ` · ${tele.mic.listeners} listening` : "");
+  if (tele.rec)
+    document.getElementById("epInfo").textContent =
+      tele.rec.written ? `last episode: ${tele.rec.written}` : " ";
+}
+
+/*
+ * Say when a control does nothing.
+ *
+ * teleop, navigate, agx-cmd and can-bridge are all off by default on the router,
+ * and for a while this page presented a full steering UI while teleop was not
+ * running - the frames went to a port with nothing bound to it and the console
+ * looked exactly as it does when everything works. A dashboard that cannot tell
+ * "sent" from "arrived" is worse than no dashboard, because it is trusted.
+ *
+ * The evidence is not that a status file exists - /var/run/*.json outlives the
+ * daemon that wrote it, and this page believed otherwise for a while. It is that
+ * the file keeps changing: the server watches for that and nulls a status that has
+ * stopped moving, so a stopped daemon reads the same here as a missing one.
+ */
+function paintWarnings() {
+  const s = tele.status;
+  if (!s) return;
+  const msgs = [];
+  const noTeleop = !s.teleop, noNav = !s.navigate;
+  if (noTeleop)
+    msgs.push("<b>teleop is not running on the router</b> — steering has nothing " +
+              "listening to it. <code>/etc/init.d/teleop start</code>");
+  else if (!s.teleop.forwarding)
+    msgs.push("teleop is running but <b>not forwarding</b> — agx-cmd is off, so " +
+              "steering reaches teleop and stops there. Nothing can move.");
+  if (noNav)
+    msgs.push("<b>navigate is not running</b> — waypoints and routes go nowhere. " +
+              "<code>/etc/init.d/navigate start</code>");
+  const el = document.getElementById("warn");
+  el.style.display = msgs.length ? "block" : "none";
+  el.innerHTML = msgs.map((m) => `<div class="keys" style="color:var(--ink)">${m}</div>`)
+    .join("");
+  // Not merely announced: the controls that cannot work are switched off.
+  document.getElementById("big").disabled = !mine || noTeleop;
+  document.getElementById("go").disabled = waypoints.length === 0 || noNav;
+  document.getElementById("navstop").disabled = noNav;
+  stickCv.style.opacity = noTeleop ? 0.4 : 1;
 }
 
 function paintStats() {
@@ -275,6 +449,13 @@ function paintStats() {
              n.state === "arrived" ? "good" : "dim");
   if (c) add("can", c.interface ? `${c.interface}, rx ${c.rx}` : "no can",
              c.rx > 0 ? "good" : "dim");
+  // The router's own deadman, which is the one that does not depend on this
+  // machine. Worth seeing: it is what stops the vehicle when this console dies.
+  const tp = s.teleop;
+  if (tp) add("teleop", `${tp.armed ? "armed" : "idle"} · ${tp.age_ms} ms old · ` +
+                        `${tp.deadman_trips} trips` +
+                        (tp.forwarding ? "" : " · not forwarding"),
+              tp.armed && tp.forwarding ? "good" : "dim");
   document.getElementById("stats").innerHTML = out.join("");
 }
 
