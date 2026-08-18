@@ -7,13 +7,27 @@
 # 1280x720 MJPEG straight from the camera. On MT7621 the only viable mode is
 # pass-through: the SoC has no JPEG encoder, so 'format MJPEG' must be what
 # the camera itself produces. Run sensor-probe to confirm before raising this.
-# Measured on the bench with a Logitech StreamCam, not guessed:
+# The frame rate was measured end to end - at the router, on the wire, and on the
+# tablet over wifi - rather than reasoned about from bitrate. What the tablet
+# actually sustains:
 #
-#   1280x720, MJPEG passthrough    61 fps    95.4 Mbit/s   loadavg 0.44
-#   same, desired_fps 20           22.5 fps  34.6 Mbit/s
+#   out  tablet over wifi   ustreamer  loadavg  slam2d match (worst)
+#    20  20.0 fps, 0 late         29%     2.76   35.9 ms (38.6)
+#    30  29.9 fps, 0 late         41%     3.64   41.7 ms (52.5)
+#    60  58-60 fps, 0 late        93%     4.38   46.4 ms (62.0)
 #
-# 95 Mbit/s does not fit 2.4 GHz at all and is heavy for 5 GHz, so the default is
-# the lower frame rate. Raise it deliberately when the client is on the wire.
+# 60 fps works. The tablet holds it over wifi with nothing dropped, the lidar
+# misses no columns and every ring is still matched - the earlier note here said
+# 95 Mbit/s "does not fit 2.4 GHz at all", and the delivered figure at 60 is
+# 62 Mbit/s on 5 GHz, so that was too pessimistic.
+#
+# The default is 30 because of the last column, not the bandwidth. Serving 60 fps
+# costs a whole core of four, and slam2d's worst match goes from 39% of the ring
+# interval to 62% of it. Nothing is dropped today, but the vehicle is not driving
+# today either, and navigate wants the same cpu when it is. 30 doubles the
+# smoothness of 20 and leaves the mapper half its interval.
+#
+# Raise it to 60 when the camera is what matters and the vehicle is parked.
 #
 # quality is left at 80 but is NOT the knob to turn: with an MJPEG source the
 # camera does the encoding and ustreamer relays, so dropping 80 to 70 changed the
@@ -49,7 +63,7 @@ set ustreamer.video0.format='MJPEG'
 # HW stays because it states the intent plainly for an MJPEG source. It is not a
 # fix for anything.
 set ustreamer.video0.encoder='HW'
-set ustreamer.video0.desired_fps='20'
+set ustreamer.video0.desired_fps='30'
 set ustreamer.video0.quality='80'
 set ustreamer.video0.host='0.0.0.0'
 set ustreamer.video0.port='8080'

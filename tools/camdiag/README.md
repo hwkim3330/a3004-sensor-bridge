@@ -48,6 +48,29 @@ buy latency:
 It would save USB traffic and some capture overhead. That is a CPU argument, not
 a latency one.
 
+## Frame rate: 60 fps works
+
+Measured at the router, on the wire and on the tablet over wifi:
+
+| out | tablet over wifi | ustreamer | loadavg | slam2d match, median (worst) | score |
+|---|---|---|---|---|---|
+| 20 | 20.0 fps, 0 late | 29% | 2.76 | 35.9 ms (38.6) | 84.5% |
+| 30 | 29.9 fps, 0 late | 41% | 3.64 | 41.7 ms (52.5) | 88% |
+| 60 | 58-60 fps, 0 late | 93% | 4.38 | 46.4 ms (62.0) | 89% |
+
+The tablet holds 60 fps over wifi with nothing dropped as stale, the lidar misses
+no columns, and every ring is still matched. 62 Mbit/s delivered at 60 - the old
+note in the uci script called 95 Mbit/s impossible on wifi and was too pessimistic.
+
+The default is 30 anyway, and the reason is the last column rather than the
+bandwidth. Serving 60 fps costs a whole core of four, and the mapper's worst match
+goes from 39% of the ring interval to 62% of it. Nothing is dropped today - but
+nothing is driving today either, and navigate wants the same cpu when it is.
+
+Note this does not buy much latency: a frame still takes ~15 ms to arrive and the
+camera still takes ~140 ms to produce it. What it buys is smoothness, and a
+shorter wait for the next frame after something moves - 8 ms instead of 25.
+
 ## What did help, and by a lot
 
 Two clients where one would do, and one where none would do.
