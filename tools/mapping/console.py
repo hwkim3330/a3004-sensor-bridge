@@ -131,6 +131,63 @@ class Ring(threading.Thread):
                                           offset=20 + 2 * n)
 
 
+class Cam(threading.Thread):
+    """The newest camera frame, and no queue behind it.
+
+    Reading the stream from the draw loop looks fine and is not. VideoCapture
+    hands over the *next* frame in order, and this loop also polls four status
+    files and redraws a 1600x660 canvas, so it does not run at 20 fps. Every
+    revolution it falls short, one more frame backs up - first in FFmpeg, then
+    in the kernel receive queue, and the picture drifts further behind with no
+    mechanism to catch up. Found in the act: 4.5 MB queued on the socket after
+    two hours, which at 25 Mbit/s is a view well over a second stale, and the
+    router had been sending all of it.
+
+    So the read happens here, as fast as the stream arrives, and only the last
+    frame is kept. The draw loop takes whatever is current and the rest are
+    dropped, which is what you want from a camera you are driving by.
+    """
+
+    def __init__(self, url):
+        super().__init__(daemon=True)
+        self.url = url
+        self.frame = None
+        self.unread = False
+        self.n = 0
+        self.dropped = 0
+        self.stop = threading.Event()
+
+    def run(self):
+        cap = cv2.VideoCapture(self.url)
+        # Ask the backend for a shallow buffer too. Not every backend honours
+        # it, which is why it is a belt over the braces above and not the fix.
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        while not self.stop.is_set():
+            ok, f = cap.read()
+            if not ok:
+                time.sleep(0.2)
+                continue
+            if self.unread:
+                self.dropped += 1
+            self.frame = f
+            self.unread = True
+            self.n += 1
+        cap.release()
+
+    def latest(self):
+        """The newest frame, or the last one again if none has arrived since.
+
+        Not cleared on read: a draw loop faster than the stream would otherwise
+        alternate between a picture and "no camera", which would say the camera
+        had failed when the truth is that it is a 20 fps camera.
+        """
+        self.unread = False
+        return self.frame
+
+
 class MapPoll(threading.Thread):
     """The exported occupancy grid, and the pose that goes with it."""
 
@@ -266,6 +323,15 @@ def main():
     ap.add_argument("--snapshot", default="",
                     help="write the composed window here and exit")
     ap.add_argument("--seconds", type=float, default=0.0)
+    # Off by default, because MJPEG costs the router once per viewer.
+    #
+    # There is no shared encode to amortise: every client gets its own copy of
+    # the bytes, so a second viewer is a second 25 Mbit/s and, measured on the
+    # bench, another 26% of a core. The tablet is the screen somebody drives by,
+    # so it gets the camera; this console is for the lidar, the map and the
+    # telemetry, and asks for video only when that is what you came for.
+    ap.add_argument("--camera", action="store_true",
+                    help="also stream the camera (doubles the router's video load)")
     a = ap.parse_args()
     base = f"http://{a.host}/sensors"
 
@@ -276,7 +342,10 @@ def main():
     mp = MapPoll(base)
     mp.start()
 
-    cam = cv2.VideoCapture(f"http://{a.host}:8080/stream")
+    cam = None
+    if a.camera:
+        cam = Cam(f"http://{a.host}:8080/stream")
+        cam.start()
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     seq = 0
     armed = False
@@ -290,8 +359,8 @@ def main():
     while True:
         canvas = np.full((H, W, 3), 24, dtype=np.uint8)
 
-        ok, frame = cam.read() if cam.isOpened() else (False, None)
-        if ok and frame is not None:
+        frame = cam.latest() if cam is not None else None
+        if frame is not None:
             fh = 470
             fw = int(frame.shape[1] * fh / frame.shape[0])
             canvas[20:20 + fh, 20:20 + fw] = cv2.resize(frame, (fw, fh))
@@ -299,7 +368,13 @@ def main():
             cv2.putText(canvas, "camera", (26, 40), cv2.FONT_HERSHEY_SIMPLEX,
                         0.42, (220, 220, 230), 1)
         else:
-            cv2.putText(canvas, "no camera", (30, 50),
+            # Distinguish "not asked for" from "asked for and not arriving".
+            # The old text said "no camera" either way, which reads as a fault
+            # when the truth is that the tablet has the camera and this console
+            # deliberately does not.
+            msg = ("camera not requested - run with --camera"
+                   if cam is None else "no camera")
+            cv2.putText(canvas, msg, (30, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 120, 130), 1)
 
         draw_mic(canvas, 20, 510, 820, 120, mic)
@@ -407,7 +482,8 @@ def main():
             pass
 
     mic.stop = ring.stop = mp.stop = True
-    cam.release()
+    if cam is not None:
+        cam.stop.set()
     cv2.destroyAllWindows()
     return 0
 
