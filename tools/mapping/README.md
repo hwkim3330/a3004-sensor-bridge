@@ -8,9 +8,17 @@ programs turn that into a map.
 python3 -m venv --system-site-packages ~/mapenv
 ~/mapenv/bin/pip install kiss-icp open3d      # ouster-sdk comes from the system
 
+~/mapenv/bin/python live_view.py --accumulate # watch it now, in 3D
 python3 capture.py run1 60                    # record a minute, moving the sensor
 ~/mapenv/bin/python build_map.py run1         # map.ply, mesh.ply, trajectory.txt
 ```
+
+`live_view.py` opens a window and draws the current revolution, coloured by
+reflectivity. `--accumulate` merges revolutions into a voxel grid rather than
+appending them: appending reached a million points in ten seconds and dropped the
+viewer to 3.5 Hz while the sensor was still sending at 10, and a stationary
+sensor is re-measuring surfaces it already has. Merged, it holds about 40k points
+and 10.4 Hz - the sensor's own rate - and still fills in gaps.
 
 ## Why lidar-only
 
