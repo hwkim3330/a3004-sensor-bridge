@@ -113,6 +113,7 @@ whose only value is being current should not be buffered at somebody.
 
 ## Not here yet
 
-- 3D. The lidar relay is off by default (it was found sending 64 Mbit/s to a port
-  with nothing bound to it, for 1.4 of the board's 4 cores). Turn it on for
-  `mapping/capture.py` and friends, and off afterwards.
+- 3D. This page shows the 2D map and the ring. The full point cloud is
+  `mapping/`'s business, and those tools now borrow the router's raw-lidar relay
+  for the length of a run and hand it back, so nothing has to be turned on here
+  first.

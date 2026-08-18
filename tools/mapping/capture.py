@@ -40,7 +40,23 @@ def main():
     ap.add_argument("--imu-port", type=int, default=7503)
     ap.add_argument("--sensor", default="192.168.1.50")
     ap.add_argument("--bind", default="")
+    # The relay is off by default on the router, because it was found sending
+    # 64 Mbit/s to a port with nothing bound to it. Borrowing it for the length of
+    # this run - on at the start, back as it was at the end - is what stops that
+    # happening again, and stops this tool sitting silently on an empty socket.
+    ap.add_argument("--relay", default="auto",
+                    help="auto: point the router's raw-lidar relay here for this "
+                         "run and restore it after. keep: leave it alone.")
+    ap.add_argument("--relay-to", default="",
+                    help="address the router should relay to; default is this "
+                         "machine's address on the router's network")
+    ap.add_argument("--router", default="192.168.1.1")
     a = ap.parse_args()
+
+    if a.relay == "auto":
+        import relay as _relay
+        _dest = a.relay_to or f"{_relay.local_address_for(a.router)}:{a.port}"
+        _relay.borrow_for_process(a.router, _dest)
 
     os.makedirs(a.out, exist_ok=True)
 

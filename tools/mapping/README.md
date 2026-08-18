@@ -5,13 +5,42 @@ LAN can rebuild the full 3D scan without the sensor knowing it exists. These two
 programs turn that into a map.
 
 ```sh
-python3 -m venv --system-site-packages ~/mapenv
-~/mapenv/bin/pip install kiss-icp open3d      # ouster-sdk comes from the system
+pip3 install --user --break-system-packages open3d   # kiss-icp and ouster-sdk are
+                                                     # already on this machine
 
-~/mapenv/bin/python live_view.py --accumulate # watch it now, in 3D
-python3 capture.py run1 60                    # record a minute, moving the sensor
-~/mapenv/bin/python build_map.py run1         # map.ply, mesh.ply, trajectory.txt
+./live_view.py --accumulate                   # watch it now, in 3D
+./capture.py run1 60                          # record a minute, moving the sensor
+./build_map.py run1                           # map.ply, mesh.ply, trajectory.txt
 ```
+
+Not a venv any more. There was one under a temporary directory, which is how the
+PC console came to be running out of `/tmp` — it worked until the directory went
+away. `--user` keeps it in the home directory and out of the system packages this
+machine shares with unrelated work.
+
+One caution earned the hard way: installing more than `open3d` here drags `click`
+and `rich` around, and this machine has packages that pin them in both directions
+— `huggingface-hub` wants `click>=8.4.2`, `gtts` and `ouster-sdk` want `<8.2`.
+Those two cannot both be satisfied and the conflict is not new; leave the versions
+where they are and install nothing else.
+
+## The relay switches itself on
+
+`capture.py`, `live_view.py` and `ros2_bridge.py` all need the router's raw-lidar
+relay pointed here, and it is off by default for a good reason: it was found
+sending **64.2 Mbit/s to a port with nothing bound to it**, which cost about 1.4
+of the board's 4 cores for packets nobody read.
+
+So the three of them borrow it. Each turns the relay on at startup, pointed at
+whichever of this machine's addresses actually routes to the router, and puts it
+back exactly as it was on the way out — including after Ctrl-C or an exception.
+Both moves are printed, and each costs about nine seconds because `--relay` is a
+start argument for `ouster-edge`. `--relay keep` opts out.
+
+`relay.py status|on|off` does the same by hand. That is the thing to reach for if
+a reader is killed outright rather than interrupted, which is the one case the
+automatic restore cannot cover; it will say if the relay was left pointing
+somewhere.
 
 `live_view.py` opens a window and draws the current revolution, coloured by
 reflectivity. `--accumulate` merges revolutions into a voxel grid rather than
