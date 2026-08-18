@@ -52,20 +52,34 @@ a latency one.
 
 Measured at the router, on the wire and on the tablet over wifi:
 
-| out | tablet over wifi | ustreamer | loadavg | slam2d match, median (worst) | score |
-|---|---|---|---|---|---|
-| 20 | 20.0 fps, 0 late | 29% | 2.76 | 35.9 ms (38.6) | 84.5% |
-| 30 | 29.9 fps, 0 late | 41% | 3.64 | 41.7 ms (52.5) | 88% |
-| 60 | 58-60 fps, 0 late | 93% | 4.38 | 46.4 ms (62.0) | 89% |
+| out | tablet over wifi | ustreamer | loadavg |
+|---|---|---|---|
+| 20 | 20.0 fps, 0 late | 29% | 2.76 |
+| 30 | 29.9 fps, 0 late | 41% | 3.64 |
+| 60 | 58-60 fps, 0-1 late | 93% | 4.38 |
 
-The tablet holds 60 fps over wifi with nothing dropped as stale, the lidar misses
-no columns, and every ring is still matched. 62 Mbit/s delivered at 60 - the old
-note in the uci script called 95 Mbit/s impossible on wifi and was too pessimistic.
+The tablet holds 60 fps over wifi, the lidar misses no columns, and every ring is
+still matched. 62 Mbit/s delivered at 60 - the old note in the uci script called
+95 Mbit/s impossible on wifi and was too pessimistic.
 
-The default is 30 anyway, and the reason is the last column rather than the
-bandwidth. Serving 60 fps costs a whole core of four, and the mapper's worst match
-goes from 39% of the ring interval to 62% of it. Nothing is dropped today - but
-nothing is driving today either, and navigate wants the same cpu when it is.
+### Watch it for longer than ten seconds
+
+The first pass sampled the mapper eight times per setting and made 60 fps look
+comfortable. Over 90 seconds per setting, which is long enough to see the tail:
+
+| out | rings matched | slam2d match, median | worst, of the 100 ms interval | score median / min |
+|---|---|---|---|---|
+| 30 | 899/899 | 38.1 ms | **48.1 ms (48%)** | 87% / 83% |
+| 60 | 902/902 | 53.4 ms | **91.9 ms (92%)** | 86% / 74% |
+
+Nothing failed at either rate. But at 60 the worst match leaves 8 ms of a 100 ms
+ring interval, and the score floor drops from 83% to 74% - two independent signs
+of the matcher being squeezed. The eight-sample figure for the same setting was
+62 ms, so the short window was not measuring the thing that decides this.
+
+Hence 30. Not for bandwidth: serving 60 fps costs a whole core of four, and the
+margin it leaves the mapper is inside the noise of one busy moment. Nothing is
+driving today, and navigate wants the same cpu when it is.
 
 Note this does not buy much latency: a frame still takes ~15 ms to arrive and the
 camera still takes ~140 ms to produce it. What it buys is smoothness, and a

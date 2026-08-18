@@ -11,21 +11,28 @@
 # tablet over wifi - rather than reasoned about from bitrate. What the tablet
 # actually sustains:
 #
-#   out  tablet over wifi   ustreamer  loadavg  slam2d match (worst)
-#    20  20.0 fps, 0 late         29%     2.76   35.9 ms (38.6)
-#    30  29.9 fps, 0 late         41%     3.64   41.7 ms (52.5)
-#    60  58-60 fps, 0 late        93%     4.38   46.4 ms (62.0)
+#   out  tablet over wifi   ustreamer  loadavg
+#    20  20.0 fps, 0 late         29%     2.76
+#    30  29.9 fps, 0 late         41%     3.64
+#    60  58-60 fps, 0-1 late      93%     4.38
+#
+# And over 90 s per setting, which is what shows the tail the mapper cares about:
+#
+#   out  rings matched  match median  worst, of the 100 ms ring interval
+#    30      899/899        38.1 ms    48.1 ms  (48%)
+#    60      902/902        53.4 ms    91.9 ms  (92%)
 #
 # 60 fps works. The tablet holds it over wifi with nothing dropped, the lidar
 # misses no columns and every ring is still matched - the earlier note here said
 # 95 Mbit/s "does not fit 2.4 GHz at all", and the delivered figure at 60 is
 # 62 Mbit/s on 5 GHz, so that was too pessimistic.
 #
-# The default is 30 because of the last column, not the bandwidth. Serving 60 fps
-# costs a whole core of four, and slam2d's worst match goes from 39% of the ring
-# interval to 62% of it. Nothing is dropped today, but the vehicle is not driving
-# today either, and navigate wants the same cpu when it is. 30 doubles the
-# smoothness of 20 and leaves the mapper half its interval.
+# The default is 30 because of that last column, not the bandwidth. Serving 60 fps
+# costs a whole core of four and leaves the mapper 8 ms of its 100 ms interval in
+# the worst case, with the match score floor dropping from 83% to 74%. Nothing is
+# dropped today, but the vehicle is not driving today either, and navigate wants
+# the same cpu when it is. 30 doubles the smoothness of 20 and still leaves the
+# mapper half its interval.
 #
 # Raise it to 60 when the camera is what matters and the vehicle is parked.
 #
