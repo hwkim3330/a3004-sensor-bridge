@@ -4,8 +4,15 @@
     ./server.py --host 192.168.1.1
     # then open http://localhost:8090/
 
-Add `--bind 0.0.0.0` to let another machine on the LAN open it. That is off by
-default: this page can move a vehicle.
+`--bind` takes a comma-separated list. To let the tablet or another machine on the
+vehicle's network open it, name the router-side addresses:
+
+    ./server.py --host 192.168.1.1 --bind 127.0.0.1,192.168.1.20,192.168.1.171
+
+Prefer that over `0.0.0.0`. This page can move a vehicle, and `0.0.0.0` is every
+interface — which on this bench means the office network as well as the router's.
+Verified: with the three addresses above, the tablet at 192.168.1.175 gets a 200
+and the office-side address refuses the connection.
 
 ## Where the work is split, and why there
 

@@ -402,8 +402,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="192.168.1.1", help="the router")
     ap.add_argument("--port", type=int, default=8090, help="serve here")
+    # A list, and not 0.0.0.0 by default.
+    #
+    # This page can move a vehicle, and 0.0.0.0 is every interface - which on this
+    # bench includes the office network as well as the router's. Naming the
+    # router-side addresses gives the tablet and any other machine on the vehicle's
+    # network access without publishing the steering wheel to the building.
     ap.add_argument("--bind", default="127.0.0.1",
-                    help="0.0.0.0 to let other machines on the lan open it")
+                    help="comma-separated addresses to serve on; prefer the "
+                         "router-side address over 0.0.0.0")
     a = ap.parse_args()
 
     app = web.Application()
@@ -420,9 +427,11 @@ def main():
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
 
-    print(f"  router {a.host}, console on http://"
-          f"{'localhost' if a.bind == '127.0.0.1' else a.bind}:{a.port}/")
-    web.run_app(app, host=a.bind, port=a.port, print=None)
+    binds = [h.strip() for h in a.bind.split(",") if h.strip()]
+    print(f"  router {a.host}, console on:")
+    for h in binds:
+        print(f"    http://{'localhost' if h == '127.0.0.1' else h}:{a.port}/")
+    web.run_app(app, host=binds, port=a.port, print=None)
     return 0
 
 
