@@ -65,6 +65,10 @@ static struct {
 	 * persistent while the daemon keeps running.
 	 */
 	char *map_load;
+	/* Which survey is on the grid, so a consumer can tell one floor from
+	 * another. Empty means nothing was loaded and the map is whatever has
+	 * been built since the daemon started. */
+	char loaded[64];
 	int cmd_port;
 	int map_level;
 	int status_ms;
@@ -151,7 +155,8 @@ static void status_write(void)
 		"\t\"candidates\": %u,\n"
 		"\t\"match_us\": %u,\n"
 		"\t\"at_search_edge\": %s,\n"
-		"\t\"map\": {\"cells\": %d, \"res_cm\": %d, \"bytes\": %ld}\n"
+		"\t\"map\": {\"cells\": %d, \"res_cm\": %d, \"bytes\": %ld,"
+		" \"loaded\": \"%s\"}\n"
 		"}\n",
 		(int)g.pose.x_cm, (int)g.pose.y_cm, (int)g.pose.a,
 		g.pose.x_cm / 100.0, g.pose.y_cm / 100.0,
@@ -167,7 +172,7 @@ static void status_write(void)
 		g.last_candidates, g.last_match_us,
 		g.last_at_edge ? "true" : "false",
 		(int)(g.map.w[0] * g.map.h[0]), (int)g.map.res_cm,
-		(long)(g.map.w[0] * g.map.h[0]));
+		(long)(g.map.w[0] * g.map.h[0]), g.loaded);
 	fclose(fp);
 	rename(tmp, g.status_path);
 }
@@ -304,7 +309,11 @@ static const char usage[] =
 "                         a mismatch is refused rather than resampled, because\n"
 "                         a map whose cells mean a different distance matches\n"
 "                         confidently and wrongly\n"
-"  -C, --cmd-port PORT    accept 'SAVE <path>' and 'RESET' here. /var/run is\n"
+"  -C, --cmd-port PORT    accept 'SAVE <path>', 'LOAD <path>' and 'RESET'\n"
+"                         here. LOAD swaps the survey at runtime, which is how\n"
+"                         a floor is changed; it takes the stored pose as its\n"
+"                         first guess and refuses anything that is not a\n"
+"                         level-0 map of this size and resolution. /var/run is\n"
 "                         tmpfs, so a survey has to be written somewhere that\n"
 "                         survives a reboot; SAVE always writes level 0\n"
 "  -X, --map-export PATH  map, geometry and pose in one file for a client\n"
@@ -401,6 +410,8 @@ int main(int argc, char **argv)
 			 * starts from it because it is a better guess than the
 			 * origin, and the first scan corrects it. */
 			g.pose = saved;
+			snprintf(g.loaded, sizeof(g.loaded), "%.*s",
+				 (int)sizeof(g.loaded) - 1, g.map_load);
 		} else {
 			/* Not fatal. A map that will not load is a map that
 			 * would have been matched against wrongly. */
@@ -502,11 +513,60 @@ int main(int argc, char **argv)
 				else
 					logmsg(LOG_WARNING,
 					       "cannot save map to '%s'", path);
+			} else if (!strncmp((char *)buf, "LOAD", 4)) {
+				/*
+				 * A building has floors, and a floor is a map. The
+				 * same survey cannot describe two of them, so
+				 * changing floor means changing map at runtime -
+				 * which until now could only be done by restarting
+				 * the daemon with -O.
+				 *
+				 * The pose comes from the file for the same reason
+				 * it does at startup: it is where the vehicle was
+				 * when the map was saved, which is a better first
+				 * guess than the origin and gets corrected by the
+				 * first scan. It is a guess either way. If the
+				 * vehicle is not near it the match score will say
+				 * so, and no amount of loading fixes that - a
+				 * lidar in a corridor cannot tell which corridor.
+				 */
+				char *path = (char *)buf + 4;
+				struct s2_pose saved;
+
+				while (*path == ' ')
+					path++;
+				if (*path && s2_map_read_export(&g.map, &saved, path)) {
+					g.pose = saved;
+					/* Bounded explicitly rather than left to
+					 * snprintf: truncation is what is wanted
+					 * here, but saying so removes a warning
+					 * about a path that could be longer than
+					 * the field. */
+					snprintf(g.loaded, sizeof(g.loaded),
+						 "%.*s",
+						 (int)sizeof(g.loaded) - 1, path);
+					logmsg(LOG_NOTICE,
+					       "loaded %s: pose %d,%d cm a=%d",
+					       path, (int)saved.x_cm,
+					       (int)saved.y_cm, (int)saved.a);
+				} else {
+					/* The map on the grid is untouched:
+					 * read_export refuses before it writes
+					 * anything, so a bad file leaves the
+					 * survey it was going to replace. */
+					logmsg(LOG_WARNING,
+					       "cannot load '%s' (missing, or wrong size, resolution or level)",
+					       path);
+				}
 			} else if (!strncmp((char *)buf, "RESET", 5)) {
 				s2_map_free(&g.map);
 				if (s2_map_init(&g.map, g.map_cm, g.map_cm,
 						g.res_cm)) {
 					g.pose.x_cm = g.pose.y_cm = g.pose.a = 0;
+					/* Nothing is loaded any more, and saying
+					 * otherwise would name a survey that is
+					 * no longer on the grid. */
+					g.loaded[0] = 0;
 					logmsg(LOG_NOTICE, "map reset");
 				} else {
 					logmsg(LOG_ERR, "map reset failed");

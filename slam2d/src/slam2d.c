@@ -674,9 +674,34 @@ bool s2_map_read_export(struct s2_map *m, struct s2_pose *p, const char *path)
 	}
 
 	n = (size_t)w * h;
-	if (fread(m->cell[0], 1, n, f) != n) {
-		fclose(f);
-		return false;
+	/*
+	 * Into scratch first, then commit.
+	 *
+	 * This used to fread straight into the live grid, which is fine right up
+	 * until the file is short: fread fills what it can, returns less than
+	 * asked, and the caller returns false having already replaced part of the
+	 * survey with part of a truncated one. Half of one floor and half of
+	 * another is precisely the map that looks plausible and matches wrongly,
+	 * which every other check in this function exists to prevent.
+	 *
+	 * It mattered less when loading only happened before the first scan. It
+	 * matters now that a floor can be changed at runtime, because the map
+	 * being replaced is one the vehicle is currently driving against.
+	 */
+	{
+		uint8_t *scratch = malloc(n);
+
+		if (!scratch) {
+			fclose(f);
+			return false;
+		}
+		if (fread(scratch, 1, n, f) != n) {
+			free(scratch);
+			fclose(f);
+			return false;
+		}
+		memcpy(m->cell[0], scratch, n);
+		free(scratch);
 	}
 	fclose(f);
 

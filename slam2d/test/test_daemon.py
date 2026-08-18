@@ -176,11 +176,108 @@ def run_rejections():
             os.remove(status)
 
 
+def run_map_swap():
+    """Save a survey, reset, load it back - and refuse a broken one safely.
+
+    The reason a floor is the unit here: one grid cannot hold two of them, so
+    changing floor means swapping the whole survey while the vehicle drives
+    against it. That makes a failed load much more dangerous than it was when
+    loading only happened before the first scan, because the map being replaced
+    is the one in use. A truncated file used to be read straight into the live
+    grid and only then rejected, leaving half of one floor and half of another.
+    """
+    status = tempfile.mkstemp(suffix=".json")[1]
+    saved = tempfile.mkstemp(suffix=".s2mp")[1]
+    short = tempfile.mkstemp(suffix=".s2mp")[1]
+    exp = tempfile.mkstemp(suffix=".s2mp")[1]
+    cmd_port = PORT + 91
+    proc = start(status, ("-C", str(cmd_port), "-X", exp, "-L", "0"))
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # The command socket is UDP, like the ring socket. Connecting a datagram
+    # socket only sets the default destination, so there is no handshake to race
+    # and no accept to wait for.
+    c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Build something worth saving, standing still so the pose is known.
+        for step in range(40):
+            s.sendto(ring_packet(1.0, 0.5, 0.2, step), ("127.0.0.1", PORT))
+            time.sleep(0.012)
+        time.sleep(0.5)
+        c.connect(("127.0.0.1", cmd_port))
+
+        c.sendall(f"SAVE {saved}".encode())
+        time.sleep(0.6)
+        size = os.path.getsize(saved)
+        check("survey saved", size > 1000, f"{size} bytes")
+
+        before = open(exp, "rb").read()
+        c.sendall(b"RESET")
+        time.sleep(0.6)
+        st = read_status(status)
+        check("reset clears the loaded name",
+              st is not None and st["map"].get("loaded") == "",
+              f"loaded={st and st['map'].get('loaded')!r}")
+
+        c.sendall(f"LOAD {saved}".encode())
+        time.sleep(0.6)
+        st = read_status(status)
+        check("load names the survey it took",
+              st is not None and st["map"].get("loaded") == saved,
+              f"loaded={st and st['map'].get('loaded')!r}")
+        after = open(exp, "rb").read()
+        check("the grid came back", after[32:] == before[32:],
+              f"{sum(1 for x, y in zip(after[32:], before[32:]) if x != y)}"
+              " cells differ")
+
+        # A truncated map whose cells differ from the live ones.
+        #
+        # The first version of this test truncated the very file that had just
+        # been loaded, and passed against the unfixed daemon: a partial read of
+        # the same bytes over the same bytes changes nothing, so the check could
+        # not fail and proved nothing. The header is kept so the size, resolution
+        # and level checks still pass and the read is actually reached; the cells
+        # are replaced with a value the map does not contain.
+        with open(saved, "rb") as f:
+            valid = f.read()
+        payload = bytes([0x7A]) * (len(valid) - 32)
+        with open(short, "wb") as f:
+            f.write((valid[:32] + payload)[:32 + (len(payload) // 2)])
+        c.sendall(f"LOAD {short}".encode())
+        time.sleep(0.6)
+        st = read_status(status)
+        check("a truncated map is refused",
+              st is not None and st["map"].get("loaded") == saved,
+              f"loaded={st and st['map'].get('loaded')!r}")
+        kept = open(exp, "rb").read()
+        check("and the live survey survived it", kept[32:] == after[32:],
+              f"{sum(1 for x, y in zip(kept[32:], after[32:]) if x != y)}"
+              " cells differ")
+
+        c.sendall(b"LOAD /nonexistent/nowhere.s2mp")
+        time.sleep(0.5)
+        st = read_status(status)
+        check("a missing map is refused",
+              st is not None and st["map"].get("loaded") == saved,
+              f"loaded={st and st['map'].get('loaded')!r}")
+        check("daemon still running after both refusals",
+              proc.poll() is None, f"exit={proc.poll()}")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+        s.close()
+        c.close()
+        for f in (status, saved, short, exp):
+            if os.path.exists(f):
+                os.remove(f)
+
+
 print(f"slam2d-daemon verification using {BIN}\n")
 print("  trajectory")
 run_trajectory()
 print("\n  malformed and empty input")
 run_rejections()
+print("\n  changing floor")
+run_map_swap()
 
 print()
 if fails:
