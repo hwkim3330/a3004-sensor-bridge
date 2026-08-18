@@ -82,10 +82,24 @@ without bound. It now drains on the reader thread and decodes the newest frame
 only. Measured after: 20.0 fps in, 20.0 fps drawn, 0 dropped, 11 ms per decode -
 40 ms of headroom in a 50 ms budget, so the hazard was real but not yet firing.
 
-## Also found
+## Also found, and fixed
 
-The router's clock was **1017 s behind** the PC with `ntpd` enabled. Unrelated to
-video, but it makes every timestamp on the board wrong by 17 minutes.
+The router's clock was **1017 s behind** the PC with `ntpd` enabled - because the
+board has no default route, so the pool is unreachable, and MT7621 has no
+battery-backed clock to carry time across a power cut. It cannot fix itself.
+
+`clock-offset.py --set` now pushes the time from this machine. Safe while
+everything is running: every daemon in package/keti takes its intervals from
+CLOCK_MONOTONIC and none uses gettimeofday or CLOCK_REALTIME, so a wall-clock
+jump moves no deadman and trips no watchdog. All five daemons were still up after
+a 17-minute jump.
+
+Set it in UTC. The first attempt sent this machine's local time and let the
+router's `date -s` read it in the router's zone; the PC is KST and the board is
+GMT, so the displayed clock came out looking right while the epoch was exactly
+32400 s wrong - which is the number X-Timestamp and every log line use. Residual
+after the fix: **0.34 s**, which is the ssh round trip against a `date` that
+takes whole seconds.
 
 ## Tools
 

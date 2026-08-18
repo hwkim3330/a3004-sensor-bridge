@@ -34,6 +34,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("host", nargs="?", default="192.168.1.1")
     ap.add_argument("--boundaries", type=int, default=5)
+    # Setting it, not just reporting it.
+    #
+    # The board cannot fix this itself: it has no default route, so ntpd can
+    # never reach a pool server, and MT7621 has no battery-backed clock to
+    # remember across a power cut. Left alone it boots to whatever the image was
+    # built with and drifts - 1017 s adrift when this was written.
+    #
+    # Safe to do while everything is running: every daemon on the board takes
+    # its intervals from CLOCK_MONOTONIC, so a wall-clock jump moves no deadman
+    # and trips no watchdog. Checked, not assumed - nothing in package/keti uses
+    # gettimeofday or CLOCK_REALTIME.
+    ap.add_argument("--set", action="store_true",
+                    help="also set the router's clock from this machine")
     a = ap.parse_args()
 
     # Enough seconds to see the boundaries, plus a little; the router stops on
@@ -74,7 +87,34 @@ def main():
     print(f"  pc minus router: {off:+.3f} s   "
           f"(median of {len(offsets)}, spread {spread*1000:.0f} ms, "
           f"{n} samples)")
-    print(f"  frames.py --clock-offset {off:.3f}")
+
+    if not a.set:
+        print(f"  frames.py --clock-offset {off:.3f}")
+        return 0
+
+    # BusyBox date takes no sub-second field, so the best available is to send a
+    # whole second and aim at its start: sleep until just before the next tick,
+    # then set that second. What is left over is the ssh round trip, tens of
+    # milliseconds, which is beside the point for a clock that was 17 minutes out.
+    # UTC on both sides, and -u on the far side.
+    #
+    # The first version sent local time and let the router's `date -s` read it in
+    # the router's zone. The two zones are not the same - this PC is KST and the
+    # board is GMT - so the displayed clock came out looking correct while the
+    # epoch was exactly 32400 s wrong, which is the number that X-Timestamp and
+    # every log line actually use. A clock that reads right and is nine hours out
+    # is worse than one that is visibly seventeen minutes slow.
+    now = time.time()
+    target = int(now) + 2
+    time.sleep(max(0.0, target - time.time() - 0.05))
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(target))
+    r = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=5", f"root@{a.host}",
+         f'date -u -s "{stamp}" >/dev/null && date -u'],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"could not set the clock: {r.stderr.strip()}")
+    print(f"  set to {stamp}, router now says {r.stdout.strip()}")
     return 0
 
 
