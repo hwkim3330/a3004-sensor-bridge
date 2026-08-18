@@ -1,0 +1,458 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>A3004 console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #f2f2f5; --surface: #fff; --ink: #1c1c1e; --dim: #8a8a8e;
+    --line: #e3e3e8; --accent: #007aff; --good: #34c759; --bad: #ff3b30;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
+    font: 15px/1.4 -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+    font-feature-settings: "tnum";
+  }
+  .grid { display: grid; gap: 12px; grid-template-columns: 0.85fr 2fr 0.85fr; }
+  .wide { grid-column: 1 / -1; }
+  .card {
+    background: var(--surface); border-radius: var(--radius); padding: 12px 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.10);
+  }
+  .card.flush { padding: 0; overflow: hidden; }
+  h2 {
+    margin: 0 0 8px; font-size: 13px; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--ink); font-weight: 600;
+  }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .spread { justify-content: space-between; }
+  .dim { color: var(--dim); }
+  .good { color: var(--good); } .bad { color: var(--bad); }
+  canvas, img.cam { display: block; width: 100%; }
+  img.cam { aspect-ratio: 16/9; object-fit: contain; background: #000; }
+  button {
+    font: inherit; font-weight: 500; border: 0; border-radius: 999px;
+    padding: 8px 14px; background: #ececf0; color: var(--ink); cursor: pointer;
+  }
+  button:active { transform: scale(.97); }
+  button.on { background: var(--accent); color: #fff; }
+  button.danger { background: var(--bad); color: #fff; }
+  button.quiet { background: #ececf0; color: var(--dim); }
+  button[disabled] { opacity: .45; cursor: default; }
+  #big { width: 100%; padding: 16px; font-size: 19px; font-weight: 600; }
+  .mono { font-variant-numeric: tabular-nums; }
+  .stat { display: flex; justify-content: space-between; gap: 10px;
+          padding: 3px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .stat:last-child { border-bottom: 0; }
+  .keys { font-size: 12px; color: var(--dim); }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+</style>
+
+<div class="row spread" style="margin-bottom:10px">
+  <strong>A3004 console</strong>
+  <span class="row">
+    <span id="link" class="dim">connecting</span>
+    <span id="who" class="dim"></span>
+  </span>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Lidar</h2>
+    <canvas id="ring" width="420" height="420"></canvas>
+    <div class="keys mono" id="ringInfo">&nbsp;</div>
+  </div>
+
+  <div class="card flush">
+    <img class="cam" id="cam" alt="camera">
+  </div>
+
+  <div class="card">
+    <h2>Status</h2>
+    <div id="stats"></div>
+  </div>
+
+  <div class="card wide">
+    <div class="row spread" style="margin-bottom:10px">
+      <h2 style="margin:0">Map &amp; drive</h2>
+      <span class="row">
+        <span class="keys">floor</span>
+        <button data-floor="1" class="floor on">1</button>
+        <button data-floor="2" class="floor">2</button>
+        <button data-floor="3" class="floor">3</button>
+        <button id="save" class="quiet">Save</button>
+        <button id="load" class="quiet">Load</button>
+        <button id="reset" class="quiet">Reset</button>
+      </span>
+    </div>
+    <div class="grid" style="grid-template-columns: 2fr 1fr">
+      <div>
+        <canvas id="map" width="900" height="440"
+                style="border-radius:10px;background:#fafafc"></canvas>
+        <div class="keys">
+          <span id="mapInfo"></span> &middot;
+          click to add a waypoint &middot;
+          <span id="wpInfo">none</span>
+        </div>
+      </div>
+      <div>
+        <div class="row" style="margin-bottom:10px">
+          <button id="take" class="on">Take control</button>
+          <button id="go" class="quiet" disabled>Go here</button>
+          <button id="navstop" class="quiet">Nav stop</button>
+          <button id="undo" class="quiet">Undo</button>
+        </div>
+        <button id="big" class="on">Arm</button>
+        <div class="keys" style="margin-top:10px">
+          <b>W A S D</b> forward / strafe &middot; <b>Q E</b> rotate &middot;
+          <b>Shift</b> slow &middot; <b>Space</b> stop.
+          Steering only works while this tab has control and focus; letting go of
+          the keys, or of the tab, brings the vehicle to neutral.
+        </div>
+        <div class="keys mono" id="driveInfo" style="margin-top:8px">&nbsp;</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const S2_UNKNOWN = 128, S2_TURN = 4096;
+let ws, tele = {}, mine = false, armed = false, floor = 1;
+let waypoints = [], mapData = null;
+const keys = new Set();
+
+// ---------------------------------------------------------------- transport
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { setLink("connected", "good"); send({t: "take"}); };
+  ws.onclose = () => {
+    setLink("disconnected", "bad"); mine = false; armed = false; paint();
+    setTimeout(connect, 800);
+  };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.t === "tele") { tele = m; mine = m.drive.mine; armed = m.drive.armed; paint(); }
+    else if (m.t === "control") { mine = m.ok; paint(); }
+  };
+}
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function setLink(text, cls) {
+  const el = document.getElementById("link");
+  el.textContent = text; el.className = cls || "dim";
+}
+
+// The browser sends intent, not frames. The server keeps the 50 Hz stream and
+// has its own deadman, so a tab that stops sending disarms rather than leaving
+// the last command latched - which is why this rate can be leisurely.
+setInterval(() => {
+  if (!mine) return;
+  const slow = keys.has("Shift") ? 0.35 : 1;
+  let y = (keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0);
+  let x = (keys.has("d") ? 1 : 0) - (keys.has("a") ? 1 : 0);
+  let r = (keys.has("q") ? 1 : 0) - (keys.has("e") ? 1 : 0);
+  send({t: "intent", x: x * slow, y: y * slow, r: r * slow, armed});
+}, 50);
+
+// ---------------------------------------------------------------- keyboard
+const MAPPED = {w: "w", a: "a", s: "s", d: "d", q: "q", e: "e",
+                ArrowUp: "w", ArrowDown: "s", ArrowLeft: "a", ArrowRight: "d"};
+addEventListener("keydown", (e) => {
+  if (e.key === " ") { armed = false; keys.clear(); paint(); e.preventDefault(); return; }
+  if (e.key === "Shift") { keys.add("Shift"); return; }
+  const k = MAPPED[e.key];
+  if (k) { keys.add(k); e.preventDefault(); }
+});
+addEventListener("keyup", (e) => {
+  if (e.key === "Shift") { keys.delete("Shift"); return; }
+  const k = MAPPED[e.key];
+  if (k) keys.delete(k);
+});
+// A tab that loses focus keeps no keys held: the OS stops delivering keyup when
+// focus moves, so without this a key released elsewhere would stay down here.
+addEventListener("blur", () => { keys.clear(); armed = false; paint(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { keys.clear(); armed = false; paint(); }
+});
+
+// ---------------------------------------------------------------- controls
+document.getElementById("take").onclick = () => send({t: mine ? "release" : "take"});
+document.getElementById("big").onclick = () => {
+  if (!mine) return;
+  armed = !armed;
+  if (!armed) { keys.clear(); send({t: "navstop"}); }
+  paint();
+};
+document.getElementById("navstop").onclick = () => send({t: "navstop"});
+document.getElementById("undo").onclick = () => { waypoints.pop(); paintMap(); };
+document.getElementById("go").onclick = () => {
+  if (waypoints.length === 1) send({t: "goal", x: waypoints[0][0], y: waypoints[0][1]});
+  else if (waypoints.length > 1) send({t: "route", pts: waypoints});
+  waypoints = []; paintMap();
+};
+document.querySelectorAll(".floor").forEach((b) => b.onclick = () => {
+  floor = +b.dataset.floor;
+  document.querySelectorAll(".floor").forEach((o) =>
+    o.classList.toggle("on", o === b));
+});
+document.getElementById("save").onclick = () => send({t: "map", op: "save", floor});
+document.getElementById("load").onclick = () => send({t: "map", op: "load", floor});
+let resetArmed = false;
+document.getElementById("reset").onclick = (e) => {
+  // Two clicks, like the tablet: this is the only button here that destroys a
+  // survey somebody walked a building to build.
+  if (!resetArmed) {
+    resetArmed = true; e.target.textContent = "Sure?";
+    e.target.classList.add("danger");
+    setTimeout(() => {
+      resetArmed = false; e.target.textContent = "Reset";
+      e.target.classList.remove("danger");
+    }, 4000);
+    return;
+  }
+  resetArmed = false; e.target.textContent = "Reset";
+  e.target.classList.remove("danger");
+  send({t: "map", op: "reset", floor});
+};
+
+// ---------------------------------------------------------------- painting
+function paint() {
+  const t = document.getElementById("take");
+  t.textContent = mine ? "Release control" : "Take control";
+  t.className = mine ? "on" : "quiet";
+  const b = document.getElementById("big");
+  b.textContent = armed ? "Stop" : "Arm";
+  b.className = armed ? "danger" : "on";
+  b.disabled = !mine;
+  // From `mine`, the same value the button uses. These were computed separately
+  // and disagreed on screen - the header said "nobody driving" beside a Release
+  // button and a frame counter that was climbing, because the header was painted
+  // from an older telemetry message than the one that granted control.
+  document.getElementById("who").textContent =
+    mine ? "you are driving"
+         : (tele.drive && tele.drive.held) ? "someone else is driving"
+         : "nobody driving";
+  document.getElementById("go").disabled = waypoints.length === 0;
+  if (tele.drive)
+    document.getElementById("driveInfo").textContent =
+      `${tele.drive.sent} frames sent, ${tele.drive.lapsed} deadman lapses`;
+  paintStats(); paintRing();
+}
+
+function paintStats() {
+  const s = tele.status || {}, out = [];
+  const add = (k, v, cls) => out.push(
+    `<div class="stat"><span class="dim">${k}</span>` +
+    `<span class="mono ${cls || ""}">${v}</span></div>`);
+  const o = s.ouster, m = s.slam2d, n = s.navigate, c = s.can;
+  add("camera", tele.cam ? tele.cam.state : "-",
+      tele.cam && tele.cam.state === "live" ? "good" : "dim");
+  add("ring", tele.ring && tele.ring.age !== null
+      ? `frame ${tele.ring.frame}, ${tele.ring.age}s ago` : "none",
+      tele.ring && tele.ring.age !== null && tele.ring.age < 1 ? "good" : "bad");
+  if (o) add("lidar", `${o.packets || 0} pkt, ${o.missed_columns || 0} missed`,
+             (o.missed_columns || 0) === 0 ? "good" : "bad");
+  if (m) {
+    const name = (m.map && m.map.loaded ? m.map.loaded : "").split("/").pop()
+      .replace(".s2mp", "");
+    add("map", `${m.score_frac_pct}% match${name ? " · " + name : " · unsaved"}`,
+        m.score_frac_pct >= 60 ? "good" : "bad");
+    add("pose", `${m.pose.x_m.toFixed(2)}, ${m.pose.y_m.toFixed(2)} m ` +
+        `@ ${m.pose.heading_deg.toFixed(0)}°`);
+  }
+  if (n) add("navigate", `${n.state}${n.fault ? " · " + n.fault : ""}`,
+             n.state === "arrived" ? "good" : "dim");
+  if (c) add("can", c.interface ? `${c.interface}, rx ${c.rx}` : "no can",
+             c.rx > 0 ? "good" : "dim");
+  document.getElementById("stats").innerHTML = out.join("");
+}
+
+function paintRing() {
+  const cv = document.getElementById("ring"), g = cv.getContext("2d");
+  const w = cv.width, h = cv.height, cx = w / 2, cy = h / 2;
+  g.clearRect(0, 0, w, h);
+  const cm = (tele.ring && tele.ring.cm) || [];
+  const maxM = 6, scale = Math.min(cx, cy) * 0.92 / maxM;
+  g.strokeStyle = "#e3e3e8"; g.fillStyle = "#8a8a8e"; g.font = "10px sans-serif";
+  for (let r = 1; r <= maxM; r++) {
+    g.beginPath(); g.arc(cx, cy, r * scale, 0, Math.PI * 2); g.stroke();
+    if (r % 2 === 0) g.fillText(`${r}m`, cx + 3, cy - r * scale + 11);
+  }
+  if (!cm.length) {
+    g.fillText("no ring", 8, 16);
+    document.getElementById("ringInfo").textContent = " ";
+    return;
+  }
+  let hits = 0;
+  for (let i = 0; i < cm.length; i++) {
+    const v = cm[i];
+    if (v < 0) continue;
+    hits++;
+    const a = i * 2 * Math.PI / cm.length, d = v / 100;
+    if (d > maxM) continue;
+    // Near is warm, far is cool, so depth reads without a legend.
+    const t = Math.min(1, d / maxM);
+    g.fillStyle = `rgb(${Math.round(40 + 200 * (1 - t))},` +
+                  `${Math.round(120 + 80 * t)},${Math.round(90 + 150 * t)})`;
+    g.beginPath();
+    g.arc(cx + Math.cos(a) * d * scale, cy - Math.sin(a) * d * scale,
+          2.1, 0, Math.PI * 2);
+    g.fill();
+  }
+  g.fillStyle = "#007aff";
+  g.beginPath(); g.arc(cx, cy, 3.5, 0, Math.PI * 2); g.fill();
+  document.getElementById("ringInfo").textContent =
+    `${cm.length} sectors · ${hits} returns`;
+}
+
+// ------------------------------------------------------------------ the map
+async function pollMap() {
+  try {
+    const r = await fetch("/map.s2mp", {cache: "no-store"});
+    if (r.ok) { mapData = new Uint8Array(await r.arrayBuffer()); paintMap(); }
+  } catch (e) { /* the poller will try again */ }
+  setTimeout(pollMap, 700);
+}
+
+function parseMap(b) {
+  if (b.length < 32 || String.fromCharCode(b[0], b[1], b[2], b[3]) !== "S2MP")
+    return null;
+  const d = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const m = {
+    level: b[5], w: d.getUint16(6, true), h: d.getUint16(8, true),
+    res: d.getUint16(10, true),
+    ox: d.getInt32(12, true), oy: d.getInt32(16, true),
+    px: d.getInt32(20, true), py: d.getInt32(24, true),
+    pa: d.getInt32(28, true),
+  };
+  if (b.length < 32 + m.w * m.h) return null;
+  m.cells = b.subarray(32, 32 + m.w * m.h);
+  return m;
+}
+
+function paintMap() {
+  const cv = document.getElementById("map"), g = cv.getContext("2d");
+  g.fillStyle = "#fafafc"; g.fillRect(0, 0, cv.width, cv.height);
+  const m = mapData && parseMap(mapData);
+  document.getElementById("wpInfo").textContent = waypoints.length
+    ? waypoints.map(([x, y]) => `${(x / 100).toFixed(1)},${(y / 100).toFixed(1)}`).join("  ")
+    : "none";
+  if (!m) {
+    g.fillStyle = "#8a8a8e"; g.font = "13px sans-serif";
+    g.fillText("no map", 12, 22);
+    return;
+  }
+  // Occupied dark, free white, unknown grey. slam2d adds S2_HIT on a return and
+  // subtracts along the ray to it, so above S2_UNKNOWN is occupied - the same
+  // reading as the tablet, so a screenshot from either is comparable.
+  // Only the part that has been surveyed.
+  //
+  // The grid is 400x400 cells of 5 cm whatever has been seen, so drawing all of
+  // it puts a 20 m square of "unknown" on screen with the room somewhere in the
+  // middle of it. Cropping to the cells that carry information - plus a margin,
+  // and always including the vehicle - means the view is of the building rather
+  // than of the allocation.
+  // Bounded by free space, not by anything known.
+  //
+  // Taking every non-unknown cell did nothing: the map carries isolated occupied
+  // cells scattered right across the grid - single stray returns - and one of
+  // those in a far corner pushes the box back out to the full 20 m. Free cells
+  // are only marked along rays that were actually traced, so they describe where
+  // the sensor has been able to see, which is the region worth looking at. The
+  // specks stay visible if they fall inside it.
+  let lox = m.w, hix = -1, loy = m.h, hiy = -1;
+  for (let y = 0; y < m.h; y++) {
+    for (let x = 0; x < m.w; x++) {
+      if (m.cells[y * m.w + x] < S2_UNKNOWN - 8) {
+        if (x < lox) lox = x;
+        if (x > hix) hix = x;
+        if (y < loy) loy = y;
+        if (y > hiy) hiy = y;
+      }
+    }
+  }
+  if (hix < 0) { lox = 0; hix = m.w - 1; loy = 0; hiy = m.h - 1; }
+  const vcx = Math.round((m.px - m.ox) / m.res);
+  const vcy = Math.round((m.py - m.oy) / m.res);
+  lox = Math.min(lox, vcx); hix = Math.max(hix, vcx);
+  loy = Math.min(loy, vcy); hiy = Math.max(hiy, vcy);
+  const pad = Math.max(3, Math.round(150 / m.res));   // ~1.5 m, whatever the level
+  lox = Math.max(0, lox - pad); loy = Math.max(0, loy - pad);
+  hix = Math.min(m.w - 1, hix + pad); hiy = Math.min(m.h - 1, hiy + pad);
+  const cw = hix - lox + 1, ch = hiy - loy + 1;
+
+  const img = g.createImageData(cw, ch);
+  for (let y = loy; y <= hiy; y++) {
+    for (let x = lox; x <= hix; x++) {
+      const v = m.cells[y * m.w + x];
+      // Stored y up; a canvas is y down.
+      const o = (((hiy - y) * cw) + (x - lox)) * 4;
+      let c = 228;                                     // unknown
+      if (v > S2_UNKNOWN + 8) c = 40;                  // occupied
+      else if (v < S2_UNKNOWN - 8) c = 255;            // free
+      img.data[o] = img.data[o + 1] = img.data[o + 2] = c;
+      img.data[o + 3] = 255;
+    }
+  }
+  const off = new OffscreenCanvas(cw, ch);
+  off.getContext("2d").putImageData(img, 0, 0);
+  const scale = Math.min(cv.width / cw, cv.height / ch);
+  const iw = cw * scale, ih = ch * scale;
+  const x0 = (cv.width - iw) / 2, y0 = (cv.height - ih) / 2;
+  g.imageSmoothingEnabled = false;
+  g.drawImage(off, x0, y0, iw, ih);
+  cv._geom = {m, scale, x0, y0, ih, lox, loy};
+
+  const toPx = (xcm, ycm) => [
+    x0 + ((xcm - m.ox) / m.res - lox) * scale,
+    y0 + ih - ((ycm - m.oy) / m.res - loy) * scale,
+  ];
+  document.getElementById("mapInfo").textContent =
+    `${(cw * m.res / 100).toFixed(1)} x ${(ch * m.res / 100).toFixed(1)} m surveyed`
+    + ` · ${m.res} cm cells`;
+
+  if (waypoints.length) {
+    g.strokeStyle = "#ff9f0a"; g.fillStyle = "#ff9f0a"; g.lineWidth = 2;
+    g.beginPath();
+    waypoints.forEach(([xc, yc], i) => {
+      const [px, py] = toPx(xc, yc);
+      i ? g.lineTo(px, py) : g.moveTo(px, py);
+    });
+    g.stroke();
+    waypoints.forEach(([xc, yc], i) => {
+      const [px, py] = toPx(xc, yc);
+      g.beginPath(); g.arc(px, py, 4, 0, Math.PI * 2); g.fill();
+      g.fillStyle = "#1c1c1e"; g.font = "11px sans-serif";
+      g.fillText(String(i + 1), px + 6, py - 6);
+      g.fillStyle = "#ff9f0a";
+    });
+  }
+
+  const [vx, vy] = toPx(m.px, m.py);
+  const ang = m.pa * 2 * Math.PI / S2_TURN;
+  g.strokeStyle = g.fillStyle = "#34c759"; g.lineWidth = 2.5;
+  g.beginPath(); g.arc(vx, vy, 5, 0, Math.PI * 2); g.fill();
+  g.beginPath(); g.moveTo(vx, vy);
+  g.lineTo(vx + Math.cos(ang) * 20, vy - Math.sin(ang) * 20); g.stroke();
+}
+
+document.getElementById("map").onclick = (ev) => {
+  const cv = ev.currentTarget, geom = cv._geom;
+  if (!geom) return;
+  const rect = cv.getBoundingClientRect();
+  // The canvas is drawn at its attribute size and displayed at CSS size, so a
+  // click has to come back through both.
+  const cxp = (ev.clientX - rect.left) * cv.width / rect.width;
+  const cyp = (ev.clientY - rect.top) * cv.height / rect.height;
+  const {m, scale, x0, y0, ih, lox, loy} = geom;
+  const xcm = Math.round(((cxp - x0) / scale + lox) * m.res + m.ox);
+  const ycm = Math.round(((y0 + ih - cyp) / scale + loy) * m.res + m.oy);
+  waypoints.push([xcm, ycm]);
+  paintMap(); paint();
+};
+
+document.getElementById("cam").src = "/camera.mjpg";
+connect();
+pollMap();
+paint();
+</script>

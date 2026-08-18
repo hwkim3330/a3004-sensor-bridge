@@ -24,13 +24,15 @@ together.
 | 7502 | UDP | ouster-edge | the sensor | raw lidar, 4352–12544 B |
 | 7602 | UDP | slam2d / navigate / the tablet | ouster-edge | the ring, `OSED`, 1100 B |
 | 7603 | TCP | ouster-edge | dashboard | ring as Server-Sent Events |
-| 7604 | UDP | navigate | tablet | `GOAL x_cm y_cm`, `STOP` |
+| 7604 | UDP | navigate | tablet, console | `GOAL x_cm y_cm`, `ROUTE x y ...`, `STOP` |
+| 7605 | UDP | slam2d | tablet, console | `SAVE <path>`, `LOAD <path>`, `RESET` |
 | 7701 | UDP | can-bridge | a host that may inject | `BCAN` frame datagrams |
-| 7721 | UDP | teleop | tablet | `TCMD`, 24 B — operator intent |
+| 7721 | UDP | teleop | tablet, console | `TCMD`, 24 B — operator intent |
 | **7722** | UDP | agx-cmd | teleop, navigate | `TELE`, 32 B — motion command |
 | 8080 | TCP | ustreamer | tablet, browser | MJPEG |
 | 8082 | TCP | mic-stream | tablet | PCM |
 | 8083 | TCP | teleop | browser | its own control page |
+| 8090 | TCP | webconsole, **on the pc** | browser | the console page, `/ws`, `/camera.mjpg` |
 
 ## Two magics, two shapes, one direction
 

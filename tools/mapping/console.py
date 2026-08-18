@@ -260,11 +260,17 @@ def draw_map(canvas, x, y, w, h, mp, ring):
     cells, cw, ch, res, ox, oy, px, py, pa = mp.m
     # Occupied dark, free light, unknown mid grey - the same reading as the
     # tablet, so a screenshot from either is comparable.
-    img = np.full((ch, cw, 3), 60, dtype=np.uint8)
+    # This had it backwards: occupied was drawn near-white and free mid-grey,
+    # against a comment saying the opposite. slam2d adds S2_HIT on a return and
+    # subtracts along the ray to it, so above S2_UNKNOWN is occupied - and the
+    # tablet draws occupied dark. The two consoles disagreed about which parts of
+    # a room were walls, which is the sort of thing that survives a long time
+    # because either picture looks like a plausible map on its own.
+    img = np.full((ch, cw, 3), 228, dtype=np.uint8)      # unknown
     free = cells < S2_UNKNOWN - 8
     occ = cells > S2_UNKNOWN + 8
-    img[free] = (150, 150, 155)
-    img[occ] = (245, 245, 250)
+    img[free] = (255, 255, 255)
+    img[occ] = (40, 40, 40)
     img = cv2.flip(img, 0)                    # y up, as the map is stored y up
     scale = min((w - 8) / cw, (h - 8) / ch)
     img = cv2.resize(img, (int(cw * scale), int(ch * scale)),
