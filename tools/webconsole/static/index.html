@@ -84,6 +84,7 @@
         <button id="save" class="quiet">Save</button>
         <button id="load" class="quiet">Load</button>
         <button id="reset" class="quiet">Reset</button>
+        <button id="rec" class="quiet">Record</button>
       </span>
     </div>
     <div class="grid" style="grid-template-columns: 2fr 1fr">
@@ -195,6 +196,11 @@ document.querySelectorAll(".floor").forEach((b) => b.onclick = () => {
   document.querySelectorAll(".floor").forEach((o) =>
     o.classList.toggle("on", o === b));
 });
+// Recording is for teaching, not for logging: one row per ring, with the intent
+// that was in force when it arrived. It costs nothing to leave running, so the
+// button says how many rows are in the episode rather than hiding it.
+document.getElementById("rec").onclick = () =>
+  send({t: "record", on: !(tele.rec && tele.rec.on)});
 document.getElementById("save").onclick = () => send({t: "map", op: "save", floor});
 document.getElementById("load").onclick = () => send({t: "map", op: "load", floor});
 let resetArmed = false;
@@ -236,6 +242,11 @@ function paint() {
   if (tele.drive)
     document.getElementById("driveInfo").textContent =
       `${tele.drive.sent} frames sent, ${tele.drive.lapsed} deadman lapses`;
+  const rb = document.getElementById("rec");
+  if (tele.rec) {
+    rb.textContent = tele.rec.on ? `Recording ${tele.rec.rows}` : "Record";
+    rb.className = tele.rec.on ? "danger" : "quiet";
+  }
   paintStats(); paintRing();
 }
 

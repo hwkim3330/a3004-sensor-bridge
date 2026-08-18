@@ -1,0 +1,3 @@
+# Recordings are data, not source: an hour of driving is about 26 MB and belongs
+# beside the machine that made it.
+*.npz

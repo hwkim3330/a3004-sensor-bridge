@@ -118,6 +118,8 @@ class Ring:
         self.cm = []
         self.frame = 0
         self.at = 0.0
+        self.on_ring = None        # set by the app: called with each new ring
+        self.dups = 0
 
     def start(self, loop):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -139,10 +141,102 @@ class Ring:
             n = struct.unpack_from("<H", d, 6)[0]
             if 20 + 2 * n > len(d):
                 continue
+            fid = struct.unpack_from("<H", d, 8)[0]
+            #
+            # The same ring arrives more than once here.
+            #
+            # ouster-edge broadcasts to 192.168.1.255, and this machine has two
+            # interfaces on that subnet - wired to the router and wifi - so the
+            # kernel delivers one broadcast to a socket bound to 0.0.0.0 twice.
+            # Measured: 18.9 datagrams a second carrying 10.1 distinct frame ids.
+            # The tablet has one interface and never saw it.
+            #
+            # It matters for teaching. A recorder that keeps both copies gives a
+            # model two identical inputs for every one the vehicle will actually
+            # see, which is a bias with no counterpart at inference.
+            #
+            # A frame id repeats only 65536 frames later, or 1.8 hours at 10 Hz,
+            # and never as the immediately following ring, so comparing with the
+            # last one is enough.
+            if fid == self.frame and self.cm:
+                self.dups += 1
+                continue
             cm = list(struct.unpack_from(f"<{n}H", d, 20))
             self.cm = [-1 if v == 0xFFFF else v for v in cm]
-            self.frame = struct.unpack_from("<H", d, 8)[0]
+            self.frame = fid
             self.at = time.time()
+            if self.on_ring:
+                self.on_ring(self.cm)
+
+
+class Recorder:
+    """Episodes of (what the lidar saw, what the operator asked for).
+
+    One row per ring, not per wall-clock tick, because the ring is what a model
+    will be handed at inference: sampling on a timer would train on interpolated
+    inputs that never occur. The intent recorded beside it is the one in force
+    when that ring arrived.
+
+    It lives in the server because the server is the only place that holds both
+    with one clock. A separate recorder would have to bind the ring itself and
+    ask over the network what the operator was doing, and the two would drift by
+    however long that took.
+
+    Rows are kept in memory and written on stop: at 10 Hz a row is 360 int16 plus
+    a handful of floats, so an hour is about 26 MB.
+    """
+
+    def __init__(self, outdir):
+        self.dir = outdir
+        self.rows = []
+        self.on = False
+        self.name = ""
+        self.written = None
+
+    def start(self, name):
+        self.rows = []
+        self.on = True
+        self.name = name
+        self.written = None
+
+    def add(self, cm, drv, pose):
+        if not self.on:
+            return
+        self.rows.append((time.time(), cm, drv.x, drv.y, drv.r,
+                          1 if drv.armed else 0, pose))
+
+    def stop(self):
+        self.on = False
+        if not self.rows:
+            self.written = "nothing recorded"
+            return
+        import numpy as np
+        import os
+        os.makedirs(self.dir, exist_ok=True)
+        n = len(self.rows)
+        width = max(len(r[1]) for r in self.rows)
+        ring = np.zeros((n, width), dtype=np.int16)
+        for i, r in enumerate(self.rows):
+            cm = r[1]
+            # -1 already means "no return" in the ring; keep it rather than
+            # substituting a range, so a model can learn that a direction is open
+            # sky rather than a wall at the clip distance.
+            ring[i, :len(cm)] = np.array(cm, dtype=np.int16)
+        out = os.path.join(self.dir, f"{self.name}.npz")
+        np.savez_compressed(
+            out,
+            t=np.array([r[0] for r in self.rows], dtype=np.float64),
+            ring=ring,
+            x=np.array([r[2] for r in self.rows], dtype=np.float32),
+            y=np.array([r[3] for r in self.rows], dtype=np.float32),
+            r=np.array([r[4] for r in self.rows], dtype=np.float32),
+            armed=np.array([r[5] for r in self.rows], dtype=np.int8),
+            # x, y in cm and heading in slam2d's turn units, so a trajectory can
+            # be reconstructed from an episode without the status files.
+            pose=np.array([r[6] for r in self.rows], dtype=np.float32),
+        )
+        self.rows = []
+        self.written = f"{out} ({n} rows)"
 
 
 class Driver:
@@ -321,6 +415,7 @@ async def ws_handler(request):
     await ws.prepare(request)
     app = request.app
     drv = app["drv"]
+    rec = app["rec"]
     host = app["host"]
 
     async def telemetry():
@@ -328,13 +423,17 @@ async def ws_handler(request):
             ring = app["ring"]
             await ws.send_json({
                 "t": "tele",
-                "ring": {"cm": ring.cm, "frame": ring.frame,
+                "ring": {"cm": ring.cm, "frame": ring.frame, "dups": ring.dups,
                          "age": round(time.time() - ring.at, 2) if ring.at else None},
                 "status": app["state"].get("status", {}),
                 "cam": {"state": app["cam"].state, "frames": app["cam"].arrived},
                 "drive": {"mine": drv.owner is ws, "held": drv.owner is not None,
                           "armed": drv.armed, "sent": drv.sent,
-                          "lapsed": drv.lapsed},
+                          "lapsed": drv.lapsed,
+                          "x": round(drv.x, 3), "y": round(drv.y, 3),
+                          "r": round(drv.r, 3)},
+                "rec": {"on": rec.on, "rows": len(rec.rows),
+                        "written": rec.written},
             })
             await asyncio.sleep(0.2)
 
@@ -365,6 +464,11 @@ async def ws_handler(request):
                     udp_line(host, NAV_PORT, f"ROUTE {pts}")
             elif t == "navstop":
                 udp_line(host, NAV_PORT, "STOP")
+            elif t == "record":
+                if m.get("on"):
+                    rec.start(m.get("name") or time.strftime("ep-%Y%m%d-%H%M%S"))
+                else:
+                    rec.stop()
             elif t == "map":
                 op = m.get("op")
                 fl = int(m.get("floor", 1))
@@ -385,6 +489,12 @@ async def ws_handler(request):
 async def on_start(app):
     loop = asyncio.get_running_loop()
     app["ring"].start(loop)
+    def _pose():
+        p = ((app["state"].get("status", {}).get("slam2d") or {})
+             .get("pose_cm") or {})
+        return (p.get("x", 0), p.get("y", 0), p.get("a", 0))
+
+    app["ring"].on_ring = lambda cm: app["rec"].add(cm, app["drv"], _pose())
     app["state"]["tasks"] = [
         asyncio.create_task(app["cam"].run()),
         asyncio.create_task(app["drv"].run()),
@@ -420,6 +530,7 @@ def main():
     app["ring"] = Ring()
     app["drv"] = Driver(a.host)
     app["state"] = {"status": {}}
+    app["rec"] = Recorder(pathlib.Path(__file__).resolve().parent / "episodes")
     app.router.add_get("/", index)
     app.router.add_get("/camera.mjpg", camera)
     app.router.add_get("/map.s2mp", mapfile)
