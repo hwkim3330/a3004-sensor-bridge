@@ -56,3 +56,33 @@ Use the low-rate profile. `RNG19_RFL8_SIG16_NIR16` is a 12544-byte datagram,
 nine IP fragments, and only 58-60 % of it survives WiFi in either band;
 `RNG15_RFL8_NIR8` is 4352 bytes, three fragments, and 99 % arrives. See
 doc/COMPUTE.md - the limit is the frame rate, not the bit rate.
+
+## Into ROS 2, and what Autoware can and cannot use
+
+```sh
+source /opt/ros/jazzy/setup.bash
+./ros2_bridge.py                  # /ouster/points, 10 Hz, ~24k points
+ros2 run rviz2 rviz2              # fixed frame: os_sensor
+```
+
+Measured: 9.999 Hz with 2.3 ms of jitter, 23842 points per message, fields
+`x y z intensity` as float32 - the layout RViz and Autoware's perception both
+take with no converter.
+
+The bridge listens to the relayed copy instead of using the official
+`ouster-ros` driver, because that driver wants to configure and own the sensor
+and the sensor belongs to the router. That is the point of the relay: a sensor
+has one destination and there are two consumers.
+
+**On Autoware.** The perception half fits and the planning half does not. Its
+planners are built around lanelet2 maps and lanes, and a corridor has neither -
+running the whole stack indoors means fighting it. What does fit:
+
+- GPU detection (CenterPoint) on `/ouster/points`
+- RViz, for looking at the real sensor rather than a simulated one
+- NDT localisation, which loads a point cloud map - and `build_map.py` now writes
+  `map.pcd` next to `map.ply` for exactly that, so an indoor map made here is
+  usable there without a conversion step
+
+What is missing for full autonomy indoors is a lanelet2 map of a building, which
+is a different project from this one.

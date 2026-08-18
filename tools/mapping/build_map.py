@@ -154,6 +154,14 @@ def main():
     o3d.io.write_point_cloud(mp, acc)
     print(f"  wrote {mp}")
 
+    # Also as .pcd, which is what Autoware's NDT localisation loads as its
+    # point cloud map. Writing both costs nothing and means an indoor map made
+    # here is usable by the stack already on this machine, rather than needing a
+    # conversion step nobody remembers.
+    pc = os.path.join(a.capture, "map.pcd")
+    o3d.io.write_point_cloud(pc, acc)
+    print(f"  wrote {pc}  ({len(acc.points)} points)")
+
     if not a.no_mesh:
         print("  meshing ...", flush=True)
         acc.estimate_normals(
