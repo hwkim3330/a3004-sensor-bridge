@@ -160,6 +160,37 @@ static struct {
 	 * one instead of stopping. A route that skipped those checks between legs
 	 * would be a second, weaker controller wearing the same name.
 	 */
+	/*
+	 * Exploring: choosing its own goals until the floor runs out of edges.
+	 *
+	 * Mapping needs moving - the grid only fills where the sensor has been - and
+	 * driving a building by hand to build a map is the tedious half of every
+	 * demonstration. Frontier exploration is the standard answer and it suits
+	 * this robot better than a vacuum's boustrophedon sweep, because the map
+	 * already exists: a frontier is a cell known to be free with an unknown cell
+	 * beside it, which is exactly "somewhere I can stand that would tell me
+	 * something new".
+	 *
+	 * Nothing new is needed for avoidance. Every goal it picks goes through
+	 * plan_reason() like any other, the ring watchdog and the zone alarm sit
+	 * above it, and an operator taking the stick is teleop's business rather than
+	 * this daemon's. Exploring only chooses where to want to be.
+	 */
+	bool exploring;
+	int explore_targets;		/* frontiers visited this run */
+	int explore_frontiers;		/* how many the last search found */
+	int explore_rejected;		/* candidates the planner refused */
+	/*
+	 * Where it has already been sent, so a frontier that turned out to be
+	 * unreachable or uninteresting is not chosen again immediately. A ring
+	 * buffer rather than a list, because forgetting the oldest is the right
+	 * behaviour: the map changes as it drives, and a place refused ten targets
+	 * ago may be reachable now.
+	 */
+#define EXPLORE_MEMORY 16
+	int32_t seen_x_cm[EXPLORE_MEMORY];
+	int32_t seen_y_cm[EXPLORE_MEMORY];
+	int nseen;
 #define MAX_WAYPOINTS 24
 	int32_t wp_x_cm[MAX_WAYPOINTS];
 	int32_t wp_y_cm[MAX_WAYPOINTS];
@@ -554,6 +585,213 @@ static void tele_send(bool armed, int32_t strafe, int32_t fwd, int32_t yaw)
 /* Disarm and stop, and say why the first time. agx-cmd will ramp down and emit
  * its own explicit stops; sending a disarmed frame is what starts that, rather
  * than simply going quiet and waiting for its deadman. */
+/* Has this been tried lately? */
+static bool recently_tried(int32_t x_cm, int32_t y_cm)
+{
+	int i;
+	int32_t near = plan_res();	/* one planning cell counts as the same place */
+
+	for (i = 0; i < g.nseen; i++) {
+		int32_t dx = g.seen_x_cm[i] - x_cm, dy = g.seen_y_cm[i] - y_cm;
+
+		if (dx > -near && dx < near && dy > -near && dy < near)
+			return true;
+	}
+	return false;
+}
+
+static void remember_tried(int32_t x_cm, int32_t y_cm)
+{
+	if (g.nseen < EXPLORE_MEMORY) {
+		g.seen_x_cm[g.nseen] = x_cm;
+		g.seen_y_cm[g.nseen] = y_cm;
+		g.nseen++;
+		return;
+	}
+	/* Drop the oldest by shifting: EXPLORE_MEMORY is sixteen, so the shift is
+	 * cheaper to read than an index that has to be reasoned about. */
+	memmove(g.seen_x_cm, g.seen_x_cm + 1,
+		sizeof(g.seen_x_cm) - sizeof(g.seen_x_cm[0]));
+	memmove(g.seen_y_cm, g.seen_y_cm + 1,
+		sizeof(g.seen_y_cm) - sizeof(g.seen_y_cm[0]));
+	g.seen_x_cm[EXPLORE_MEMORY - 1] = x_cm;
+	g.seen_y_cm[EXPLORE_MEMORY - 1] = y_cm;
+}
+
+/*
+ * The nearest frontier the planner will accept.
+ *
+ * A frontier is a free cell with an unknown neighbour. Candidates are gathered,
+ * sorted by distance from where the vehicle is, and offered to plan_reason() in
+ * that order until one is accepted - so the answer is "the closest place I can
+ * actually get to that would show me something new", not merely the closest edge.
+ *
+ * Bounded at CANDIDATES tries, because plan_reason() is a full search each time
+ * and a room can have hundreds of frontier cells. Sixteen has been enough on this
+ * map; the count of refusals is published so a floor that needs more says so
+ * rather than looking like a floor with nothing left to see.
+ */
+#define EXPLORE_CANDIDATES 16
+static bool pick_frontier(void)
+{
+	int32_t w = plan_w(), h = plan_h(), res = plan_res();
+	const uint8_t *cell;
+	int32_t best_x[EXPLORE_CANDIDATES], best_y[EXPLORE_CANDIDATES];
+	int64_t best_d[EXPLORE_CANDIDATES];
+	int nbest = 0, i, found = 0;
+	int32_t x, y;
+	/* Close enough to be standing on it is not a frontier worth driving to; the
+	 * vehicle would arrive without moving and learn nothing. */
+	int32_t min_cm = g.arrive_cm * 2;
+
+	if (g.map.dirty)
+		s2_map_build_pyramid(&g.map);
+	cell = g.map.cell[PLAN_LEVEL];
+
+	for (y = 1; y < h - 1; y++) {
+		for (x = 1; x < w - 1; x++) {
+			uint8_t v = cell[y * w + x];
+			bool edge = false;
+			int32_t tx, ty;
+			int64_t d;
+
+			if (!(v < S2_UNKNOWN - 8))
+				continue;		/* not known free */
+			/* Four-connected is enough: a diagonal-only frontier is a
+			 * corner case that the next revolution turns into a
+			 * four-connected one anyway. */
+			if (cell[(y - 1) * w + x] == S2_UNKNOWN ||
+			    cell[(y + 1) * w + x] == S2_UNKNOWN ||
+			    cell[y * w + x - 1] == S2_UNKNOWN ||
+			    cell[y * w + x + 1] == S2_UNKNOWN)
+				edge = true;
+			if (!edge)
+				continue;
+			found++;
+			tx = g.map.origin_x_cm + x * res + res / 2;
+			ty = g.map.origin_y_cm + y * res + res / 2;
+			d = (int64_t)(tx - g.pose.x_cm) * (tx - g.pose.x_cm) +
+			    (int64_t)(ty - g.pose.y_cm) * (ty - g.pose.y_cm);
+			if (d < (int64_t)min_cm * min_cm)
+				continue;
+			if (recently_tried(tx, ty))
+				continue;
+			/*
+			 * Clear of walls, not merely free.
+			 *
+			 * A frontier is by definition at the edge of what has been
+			 * seen, and the edge of what has been seen is usually a wall -
+			 * so the obvious candidates are the cells right against one.
+			 * Sending the vehicle there took it to 17 cm from a wall in
+			 * the simulator, against the 25 cm a hand-set goal is held to.
+			 * The planner inflates obstacles for the path but the goal
+			 * cell itself is only required to be free, so this is checked
+			 * here: nothing occupied within the robot's radius of where it
+			 * is being asked to stand.
+			 */
+			{
+				int32_t k = (g.robot_radius_cm + res - 1) / res;
+				int32_t ox, oy;
+				bool tight = false;
+
+				for (oy = -k; oy <= k && !tight; oy++)
+					for (ox = -k; ox <= k; ox++) {
+						int32_t nx = x + ox, ny = y + oy;
+
+						if (nx < 0 || ny < 0 ||
+						    nx >= w || ny >= h)
+							continue;
+						if (cell[ny * w + nx] >
+						    S2_UNKNOWN + 8) {
+							tight = true;
+							break;
+						}
+					}
+				if (tight)
+					continue;
+			}
+			/* Insertion into a small sorted set, so the planner is asked
+			 * about the closest ones first without sorting the room. */
+			if (nbest < EXPLORE_CANDIDATES) {
+				best_x[nbest] = tx; best_y[nbest] = ty;
+				best_d[nbest] = d; nbest++;
+			} else {
+				int worst = 0;
+
+				for (i = 1; i < nbest; i++)
+					if (best_d[i] > best_d[worst])
+						worst = i;
+				if (d < best_d[worst]) {
+					best_x[worst] = tx; best_y[worst] = ty;
+					best_d[worst] = d;
+				}
+			}
+		}
+	}
+	g.explore_frontiers = found;
+	g.explore_rejected = 0;
+
+	while (nbest > 0) {
+		int pick = 0;
+		enum plan_fail f;
+
+		for (i = 1; i < nbest; i++)
+			if (best_d[i] < best_d[pick])
+				pick = i;
+		g.goal_x_cm = best_x[pick];
+		g.goal_y_cm = best_y[pick];
+		g.have_goal = true;
+		g.nwp = 0;
+		g.best_remaining_cm = 0x7FFFFFFF;
+		g.best_err = S2_TURN;
+		g.last_progress_ms = now_ms();
+		f = plan_reason();
+		if (f == PLAN_OK) {
+			remember_tried(g.goal_x_cm, g.goal_y_cm);
+			g.explore_targets++;
+			g.state = ST_DRIVING;
+			g.fault = NULL;
+			logmsg(LOG_NOTICE,
+			       "explore: target %d at %d,%d cm (%d frontier cells, %d refused)",
+			       g.explore_targets, (int)g.goal_x_cm,
+			       (int)g.goal_y_cm, found, g.explore_rejected);
+			return true;
+		}
+		/* Refused: remember it so the next search does not offer it again,
+		 * and try the next nearest. */
+		remember_tried(best_x[pick], best_y[pick]);
+		g.explore_rejected++;
+		best_d[pick] = 0x7FFFFFFFFFFFFFFF;
+		nbest--;
+		for (i = pick; i < nbest; i++) {
+			best_x[i] = best_x[i + 1];
+			best_y[i] = best_y[i + 1];
+			best_d[i] = best_d[i + 1];
+		}
+	}
+	g.have_goal = false;
+	return false;
+}
+
+/*
+ * While exploring, a goal that cannot be reached is a frontier to skip rather than
+ * a run to abandon - the point of choosing its own goals is that a refused one costs
+ * nothing. The safety watchdogs above do not come here: a collapsed match score, an
+ * occupied zone or a lost ring stop everything, because none of them is about this
+ * particular destination.
+ */
+static bool explore_skip(const char *why)
+{
+	if (!g.exploring)
+		return false;
+	remember_tried(g.goal_x_cm, g.goal_y_cm);
+	logmsg(LOG_NOTICE, "explore: skipping target (%s)", why);
+	if (pick_frontier())
+		return true;
+	g.exploring = false;
+	return false;
+}
+
 static void halt(enum state st, const char *why)
 {
 	if (g.state != st || g.fault != why) {
@@ -628,6 +866,8 @@ static void control_step(void)
 			       in ? "in the map" : "OUTSIDE the map",
 			       in ? g.map.cell[PLAN_LEVEL][cy * w + cx] : -1,
 			       in ? g.cost[cy * w + cx] : 0);
+			if (explore_skip("no route"))
+				return;
 			halt(ST_BLOCKED_FAULT, "no route to the goal from here");
 			return;
 		}
@@ -654,6 +894,8 @@ static void control_step(void)
 		}
 	}
 	if (t - g.last_progress_ms > (uint64_t)g.stall_ms) {
+		if (explore_skip("no progress"))
+			return;
 		halt(ST_BLOCKED_FAULT, "no progress towards the goal");
 		return;
 	}
@@ -693,6 +935,16 @@ static void control_step(void)
 				return;
 			}
 			g.nwp = 0;
+			if (g.exploring) {
+				/* Arriving is the point at which there is something
+				 * new on the map, so the next frontier is chosen from
+				 * a map that includes what this trip revealed. */
+				if (pick_frontier())
+					return;
+				g.exploring = false;
+				halt(ST_ARRIVED, "explored: no frontier left");
+				return;
+			}
 			halt(ST_ARRIVED, "goal reached");
 			return;
 		}
@@ -892,9 +1144,27 @@ static void handle_cmd(char *line)
 		g.state = ST_DRIVING;
 		logmsg(LOG_NOTICE, "route of %d legs, first %d,%d cm",
 		       n, (int)g.goal_x_cm, (int)g.goal_y_cm);
+	} else if (!strncmp(line, "EXPLORE", 7)) {
+		/*
+		 * Start choosing goals. The memory of tried places is cleared, so
+		 * asking again after it gave up is a fresh attempt rather than an
+		 * immediate second refusal - a map that has grown since may have
+		 * frontiers the last search rejected.
+		 */
+		g.exploring = true;
+		g.nseen = 0;
+		g.explore_targets = 0;
+		g.fault = NULL;
+		if (!pick_frontier()) {
+			g.exploring = false;
+			halt(ST_ARRIVED, "explored: no frontier to start from");
+		}
 	} else if (!strncmp(line, "STOP", 4) || !strncmp(line, "CLEAR", 5)) {
 		g.have_goal = false;
 		g.nwp = 0;
+		/* A stop stops exploring too. It is the one control that has to mean
+		 * the same thing whatever the daemon was doing. */
+		g.exploring = false;
 		g.state = ST_IDLE;
 		g.fault = NULL;
 		halt(ST_IDLE, "stopped by request");
@@ -923,6 +1193,11 @@ static void status_write(void)
 		/* Which leg of a route, so a client can show progress along it
 		 * rather than only the leg being driven. Zeros for a single goal. */
 		"\t\"route\": {\"legs\": %d, \"leg\": %d},\n"
+		/* Exploring, and how it is going. `frontiers` is what the last search
+		 * saw and `rejected` how many the planner refused, so a floor that has
+		 * edges it cannot reach reads differently from a floor with none. */
+		"\t\"explore\": {\"on\": %s, \"targets\": %d,"
+		" \"frontiers\": %d, \"rejected\": %d},\n"
 		"\t\"remaining_cm\": %d,\n"
 		"\t\"match_score_pct\": %d,\n"
 		"\t\"zone_alarm\": %s,\n"
@@ -940,6 +1215,8 @@ static void status_write(void)
 		(int)g.goal_x_cm, (int)g.goal_y_cm,
 		g.have_goal ? "true" : "false",
 		g.nwp, g.nwp ? g.wp_at + 1 : 0,
+		g.exploring ? "true" : "false", g.explore_targets,
+		g.explore_frontiers, g.explore_rejected,
 		(int)g.last_remaining_cm, (int)g.last_score_pct,
 		g.zone_alarm ? "true" : "false",
 		(unsigned long long)g.rings, (unsigned long long)g.matched,
@@ -1061,7 +1338,11 @@ int main(int argc, char **argv)
 	g.max_range_cm = 3000;
 	g.win_xy_cm = 40;
 	g.win_a = 120;
-	g.robot_radius_cm = 40;
+	/* 42 cm is half a SCOUT MINI's diagonal; the rest is the mount, the pose
+	 * error the mapper admits to, and the distance covered while a stop
+	 * propagates. Below the body's own half-diagonal the planner routes through
+	 * gaps the vehicle does not fit. */
+	g.robot_radius_cm = 55;
 	g.arrive_cm = 25;
 	g.min_score_pct = 25;
 	g.max_linear_pct = 35;

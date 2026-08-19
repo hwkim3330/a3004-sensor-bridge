@@ -155,6 +155,14 @@ class Sim:
     def goal(self, x_cm, y_cm):
         self.out.sendto(f"GOAL {x_cm} {y_cm}".encode(), ("127.0.0.1", CMD_PORT))
 
+    def explore(self):
+        self.out.sendto(b"EXPLORE", ("127.0.0.1", CMD_PORT))
+        time.sleep(0.3)
+
+    def stop(self):
+        self.out.sendto(b"STOP", ("127.0.0.1", CMD_PORT))
+        time.sleep(0.2)
+
     def route(self, *pts):
         """ROUTE x1 y1 x2 y2 ... in centimetres."""
         body = " ".join(str(int(v)) for xy in pts for v in xy)
@@ -403,12 +411,93 @@ def test_watchers():
             os.path.exists(status) and os.remove(status)
 
 
+def test_explore():
+    """It maps a room on its own, and stops when there is nothing new."""
+    print("  exploring on its own")
+    status = tempfile.mkstemp(suffix=".json")[1]
+    sim = Sim(status)
+    try:
+        # A first look around, so the map has free space and therefore frontiers.
+        # Exploring from an empty map has nothing to choose between.
+        for i in range(40):
+            sim.step()
+        before = sim.read().get("matched", 0)
+        sim.explore()
+        st = sim.read()
+        check("explore accepted", st.get("explore", {}).get("on") is True,
+              f"explore={st.get('explore')}")
+        check("it chose a target itself", st.get("goal_cm", {}).get("set") is True,
+              f"goal={st.get('goal_cm')}")
+
+        targets = set()
+        finished = False
+        for _ in range(2500):
+            sim.step()
+            st = sim.read()
+            ex = st.get("explore", {})
+            if ex.get("targets"):
+                targets.add(ex["targets"])
+            if not ex.get("on"):
+                finished = True
+                break
+            if st.get("state") == "stopped":
+                break
+
+        st = sim.read()
+        after = st.get("matched", 0)
+        check("it visited more than one frontier", len(targets) > 1,
+              f"targets seen: {sorted(targets)}")
+        check("it kept mapping while it drove", after > before + 100,
+              f"{before} -> {after} rings matched")
+        check("it stopped itself rather than being stopped", finished,
+              f"state={st.get('state')} fault={st.get('fault')}")
+        check("it says why it stopped",
+              (st.get("fault") or "").startswith("explored"),
+              f"fault={st.get('fault')!r}")
+        check("never touched a wall", sim.min_clear > 0.25,
+              f"closest approach {sim.min_clear:.2f} m")
+    finally:
+        sim.close()
+        if os.path.exists(status):
+            os.remove(status)
+
+
+def test_explore_yields_to_stop():
+    """STOP ends the run, not just the leg."""
+    print("  stop ends exploring")
+    status = tempfile.mkstemp(suffix=".json")[1]
+    sim = Sim(status)
+    try:
+        for i in range(40):
+            sim.step()
+        sim.explore()
+        for _ in range(60):
+            sim.step()
+        check("exploring", sim.read().get("explore", {}).get("on") is True,
+              f"explore={sim.read().get('explore')}")
+        sim.stop()
+        sim.armed_frames = 0
+        for _ in range(20):
+            sim.step()
+        st = sim.read()
+        check("stop cleared it", st.get("explore", {}).get("on") is False,
+              f"explore={st.get('explore')}")
+        check("and nothing is commanded after", sim.armed_frames == 0,
+              f"{sim.armed_frames} armed frames after")
+    finally:
+        sim.close()
+        if os.path.exists(status):
+            os.remove(status)
+
+
 print(f"navigate closed-loop verification using {BIN}\n")
 test_drive()
 test_unmapped_goal()
 test_goal_behind()
 test_route()
 test_route_refuses_a_bad_leg()
+test_explore()
+test_explore_yields_to_stop()
 test_watchers()
 
 print()
