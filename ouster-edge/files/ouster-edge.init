@@ -25,7 +25,7 @@ append_zone() {
 }
 
 start_service() {
-	local enabled port sensor_ip channels columns scan_width sectors
+	local enabled port sensor_ip channels columns scan_width sectors imu_port
 	local channel_band min_range max_range relay ring status_interval action r
 	local az_window
 
@@ -48,6 +48,10 @@ start_service() {
 	config_get action        lidar action
 	config_get_bool range_image lidar range_image 1
 	config_get range_step    lidar range_step 2
+	# The sensor's IMU. Off unless a port is configured; 7503 is where an Ouster
+	# sends it, and with nothing bound there the sensor raises a standing
+	# UDP_TRANSMISSION alert about the port.
+	config_get imu_port      lidar imu_port
 
 	# Make the sensor what this router expects, before reading back what it
 	# says. Its configuration does not survive its own reboot, and a wrong one
@@ -119,6 +123,17 @@ start_service() {
 		fi
 	fi
 
+	# The beam geometry, fetched once and served beside the range image.
+	#
+	# Detached the same way and for the same reason as the band waiter: it retries
+	# for a couple of minutes while the sensor boots, and holding procd's lock
+	# (fd 1000) in a child that lives that long is what made `restart` block for
+	# five minutes the last time something did.
+	if [ -n "$sensor_ip" ] && [ ! -s /var/run/beam.json ]; then
+		setsid /usr/sbin/ouster-beam-fetch "$sensor_ip" 30 \
+			>/dev/null 2>&1 1000>&- &
+	fi
+
 	# Prefer what the sensor reports over what is configured here - the
 	# lidar mode can be changed on the sensor without anyone updating UCI.
 	if [ -n "$sensor_ip" ]; then
@@ -160,6 +175,7 @@ start_service() {
 	[ -n "$az_window" ] && procd_append_param command --azimuth-window "$az_window"
 	[ -n "$channel_band" ] && procd_append_param command --channel-band "$channel_band"
 	[ -n "$relay" ] && procd_append_param command --relay "$relay"
+	[ -n "$imu_port" ] && procd_append_param command --imu-port "$imu_port"
 	# /var/run so it lands in tmpfs, and symlinked into /www/sensors by the
 	# dashboard package like the status file and the map.
 	[ "$range_image" = "1" ] && {

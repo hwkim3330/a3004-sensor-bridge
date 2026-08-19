@@ -60,6 +60,10 @@ define Package/a3004-sensorkit/install
 	$(LN) /var/run/navigate.json $(1)/www/sensors/navigate.json
 	$(LN) /var/run/map.s2mp $(1)/www/sensors/map.s2mp
 	$(LN) /var/run/range.bin $(1)/www/sensors/range.bin
+	# The beam angles, so a client can turn the range image into points. The
+	# tablet cannot ask the sensor for them: it is on the access point and the
+	# sensor is on the LAN, with no route between.
+	$(LN) /var/run/beam.json $(1)/www/sensors/beam.json
 
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/sensor-probe $(1)/usr/sbin/sensor-probe

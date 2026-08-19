@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -155,6 +156,27 @@ static struct {
 	 * 64 x 360, which is not something to put in a static array sized for the
 	 * maximum of either.
 	 */
+	/*
+	 * The sensor's own IMU, which was being thrown away.
+	 *
+	 * An OS1 sends 48-byte IMU datagrams to a second port, and nothing was
+	 * bound to it - so the sensor logged "Failed to send imu UDP data" as a
+	 * standing alert and the data went nowhere. It is worth having for the
+	 * thing a range scan cannot tell you: whether the vehicle is level. A 2D
+	 * map assumes the sensor is, and a ramp or a kerb makes that assumption
+	 * quietly false.
+	 *
+	 * Kept as the last sample plus a slow mean. The mean is what tilt is read
+	 * from: a single accelerometer sample on a driving robot is mostly the
+	 * motor, and gravity is the part that does not change.
+	 */
+	bool imu_enabled;
+	int imu_port;
+	uint64_t imu_packets;
+	uint64_t imu_last_ms;
+	float acc[3];			/* g, sensor frame */
+	float gyro[3];			/* deg/s */
+	float acc_mean[3];
 	bool range_image;
 	/*
 	 * Row stride. Every channel costs a range extraction per column, and 64
@@ -714,6 +736,45 @@ static void rimg_write(void)
 		unlink(tmp);
 }
 
+/*
+ * One IMU datagram.
+ *
+ * The layout is the sensor's: three 64-bit timestamps, then three float32
+ * accelerations in g, then three float32 angular rates in degrees per second.
+ * 48 bytes, little-endian, and the floats are IEEE754 - copied through memcpy
+ * rather than cast, because a cast to float* on a byte offset is undefined and
+ * MIPS will not forgive it.
+ *
+ * Sanity is checked by physics rather than by trusting the parse: a stationary
+ * sensor must read one g. If the magnitude is nowhere near that, the offsets or
+ * the byte order are wrong and the reading is refused instead of published.
+ */
+static void handle_imu(const uint8_t *buf, size_t len)
+{
+	float a[3], w[3], mag;
+	int i;
+
+	if (len < 48)
+		return;
+	memcpy(a, buf + 24, sizeof(a));
+	memcpy(w, buf + 36, sizeof(w));
+
+	mag = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+	if (!(mag > 0.2f && mag < 4.0f))
+		return;
+
+	for (i = 0; i < 3; i++) {
+		g.acc[i] = a[i];
+		g.gyro[i] = w[i];
+		/* A slow mean, about a second at the IMU's hundred hertz. Gravity is
+		 * the part of the acceleration that does not change; everything else
+		 * is the vehicle. */
+		g.acc_mean[i] += (a[i] - g.acc_mean[i]) * 0.01f;
+	}
+	g.imu_packets++;
+	g.imu_last_ms = now_ms();
+}
+
 static void status_write(void)
 {
 	char tmp[256];
@@ -750,6 +811,38 @@ static void status_write(void)
 	if (g.az_win_start >= 0)
 		fprintf(f, "\t\"azimuth_window\": [%d, %d],\n",
 			g.az_win_start, g.az_win_end);
+	if (g.imu_enabled) {
+		/*
+		 * Tilt from the mean acceleration, in degrees.
+		 *
+		 * Roll about the sensor's x, pitch about its y, with z up - the
+		 * frame the ring and the point cloud already use. Derived here
+		 * rather than in each reader so two consumers cannot disagree
+		 * about the convention, which is the sort of thing that shows up
+		 * as a map leaning the wrong way.
+		 *
+		 * Not verified against a measured tilt: the sensor has been level
+		 * on a bench throughout, where the check available is that
+		 * gravity reads 1 g and both angles read near zero. A deliberate
+		 * tip is the test this wants and has not had.
+		 */
+		double ax = g.acc_mean[0], ay = g.acc_mean[1], az = g.acc_mean[2];
+		double roll = atan2(ay, az) * 180.0 / M_PI;
+		double pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / M_PI;
+		double mag = sqrt(ax * ax + ay * ay + az * az);
+
+		fprintf(f, "\t\"imu\": {\"packets\": %llu, \"age_ms\": %llu,"
+			   " \"acc_g\": [%.3f, %.3f, %.3f],"
+			   " \"gyro_dps\": [%.2f, %.2f, %.2f],"
+			   " \"roll_deg\": %.1f, \"pitch_deg\": %.1f,"
+			   " \"gravity_g\": %.3f},\n",
+			(unsigned long long)g.imu_packets,
+			(unsigned long long)(g.imu_last_ms ?
+					     now_ms() - g.imu_last_ms : 0),
+			g.acc[0], g.acc[1], g.acc[2],
+			g.gyro[0], g.gyro[1], g.gyro[2],
+			roll, pitch, mag);
+	}
 	fprintf(f, "\t\"zone_alarm\": %s,\n", g.zone_alarm ? "true" : "false");
 	fprintf(f, "\t\"zones\": [");
 	for (z = 0; z < g.nzones; z++)
@@ -990,7 +1083,7 @@ static bool parse_zone(const char *s)
 	return true;
 }
 
-enum { OPT_AZ_WINDOW = 1000 };
+enum { OPT_AZ_WINDOW = 1000, OPT_IMU_PORT = 1001 };
 
 static void usage(const char *argv0)
 {
@@ -1001,6 +1094,10 @@ static void usage(const char *argv0)
 "  -C, --columns N          columns per packet (default 16)\n"
 "  -w, --scan-width N       columns per revolution: 512|1024|2048 (default 1024)\n"
 "  -s, --sectors N          azimuth sectors in the published ring (default 360)\n"
+"      --imu-port PORT      also receive the sensor's IMU here (7503 on an\n"
+"                           Ouster). Off unless given: the sensor sends it\n"
+"                           regardless, and with nothing bound it logs a\n"
+"                           standing UDP_TRANSMISSION alert about the port\n"
 "      --azimuth-window A:B the sensor's azimuth_window in millidegrees, e.g.\n"
 "                           315000:45000. Columns outside it are not sent by the\n"
 "                           sensor, so without this their absence is counted as\n"
@@ -1039,6 +1136,7 @@ int main(int argc, char **argv)
 		{ "sectors",      required_argument, NULL, 's' },
 		{ "channel-band", required_argument, NULL, 'b' },
 		{ "azimuth-window", required_argument, NULL, OPT_AZ_WINDOW },
+		{ "imu-port",     required_argument, NULL, OPT_IMU_PORT },
 		{ "min-range",    required_argument, NULL, 'm' },
 		{ "max-range",    required_argument, NULL, 'M' },
 		{ "relay",        required_argument, NULL, 'r' },
@@ -1060,7 +1158,8 @@ int main(int argc, char **argv)
 	struct sockaddr_in from[BATCH];
 	struct sockaddr_in addr;
 	struct sigaction sa;
-	struct pollfd pfd[2 + MAX_SSE];
+	struct pollfd pfd[3 + MAX_SSE];
+	int imusock = -1;
 	int sock, txsock, lfd = -1, rcvbuf = 4 * 1024 * 1024, opt, i;
 	uint64_t last_status = 0;
 
@@ -1089,6 +1188,10 @@ int main(int argc, char **argv)
 		case 'C': g.columns = atoi(optarg); break;
 		case 'w': g.scan_width = atoi(optarg); break;
 		case 's': g.sectors = atoi(optarg); break;
+		case OPT_IMU_PORT:
+			g.imu_port = atoi(optarg);
+			g.imu_enabled = g.imu_port > 0;
+			break;
 		case OPT_AZ_WINDOW:
 			if (sscanf(optarg, "%d:%d", &g.az_win_start,
 				   &g.az_win_end) != 2) {
@@ -1198,6 +1301,36 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/*
+	 * The IMU socket, if asked for.
+	 *
+	 * A failure here is logged and carried on from rather than fatal: the tilt
+	 * is useful and the ring is the job. Losing the accelerometer must not stop
+	 * a vehicle's map being built.
+	 */
+	if (g.imu_enabled) {
+		struct sockaddr_in ia;
+
+		imusock = socket(AF_INET, SOCK_DGRAM, 0);
+		memset(&ia, 0, sizeof(ia));
+		ia.sin_family = AF_INET;
+		ia.sin_addr.s_addr = htonl(INADDR_ANY);
+		ia.sin_port = htons((uint16_t)g.imu_port);
+		if (imusock < 0 ||
+		    bind(imusock, (struct sockaddr *)&ia, sizeof(ia)) < 0) {
+			logmsg(LOG_WARNING, "imu bind :%d: %s", g.imu_port,
+			       strerror(errno));
+			if (imusock >= 0)
+				close(imusock);
+			imusock = -1;
+			g.imu_enabled = false;
+		} else {
+			fcntl(imusock, F_SETFL,
+			      fcntl(imusock, F_GETFL, 0) | O_NONBLOCK);
+			logmsg(LOG_NOTICE, "imu on :%d", g.imu_port);
+		}
+	}
+
 	txsock = socket(AF_INET, SOCK_DGRAM, 0);
 	if (txsock < 0) {
 		logmsg(LOG_ERR, "tx socket: %s", strerror(errno));
@@ -1290,8 +1423,29 @@ int main(int argc, char **argv)
 			pfd[np++].revents = 0;
 		}
 
+		if (imusock >= 0) {
+			pfd[np].fd = imusock;
+			pfd[np].events = POLLIN;
+			pfd[np++].revents = 0;
+		}
+
 		if (poll(pfd, (nfds_t)np, g.status_ms) < 0 && errno != EINTR)
 			logmsg(LOG_WARNING, "poll: %s", strerror(errno));
+
+		/*
+		 * Drained whichever way poll came back, not only when it flagged this
+		 * socket. The lidar path below can occupy the loop for a whole batch,
+		 * and the IMU arrives at a hundred hertz into a small buffer - reading
+		 * it only when poll happened to notice would lose samples for no
+		 * reason. It is 48 bytes a go; there is nothing to save by being coy.
+		 */
+		if (imusock >= 0) {
+			uint8_t ibuf[64];
+			ssize_t in;
+
+			while ((in = recv(imusock, ibuf, sizeof(ibuf), 0)) > 0)
+				handle_imu(ibuf, (size_t)in);
+		}
 
 		if (lfd >= 0 && (pfd[1].revents & POLLIN))
 			sse_accept(lfd);

@@ -1,0 +1,39 @@
+#!/bin/sh
+# Put the sensor's beam geometry where a tablet can read it.
+#
+# A range image is a grid of distances and nothing else. To make points out of it
+# you need the direction each one was measured along, and those angles live in the
+# sensor's own metadata - 64 altitude angles spanning about -17 to +16 degrees and
+# 64 azimuth offsets of a few degrees either way, per unit, from calibration.
+#
+# The tablet cannot ask for them itself. The sensor sits on the router's LAN and
+# the tablet is on its access point, and there is no route between the two: asking
+# from the tablet returns nothing at all. So the router fetches them once and
+# serves them beside the range image it already serves.
+#
+# Retried rather than attempted, because this runs when ouster-edge starts and the
+# sensor may still be booting - it takes the better part of a minute from power on.
+# Written to a temporary name and moved, so a reader never sees half a file.
+SENSOR="${1:-192.168.1.50}"
+OUT=/var/run/beam.json
+TRIES="${2:-30}"
+
+i=0
+while [ "$i" -lt "$TRIES" ]; do
+	if wget -q -T 5 -O "$OUT.new" \
+		"http://$SENSOR/api/v1/sensor/metadata/beam_intrinsics" 2>/dev/null; then
+		# A truncated body is worse than none: it would parse as valid JSON with
+		# fewer angles than rows, and the points would come out fanned wrongly
+		# with nothing to say so.
+		if grep -q beam_altitude_angles "$OUT.new"; then
+			mv "$OUT.new" "$OUT"
+			logger -t ouster-beam "beam geometry from $SENSOR -> $OUT"
+			exit 0
+		fi
+	fi
+	rm -f "$OUT.new"
+	i=$((i + 1))
+	sleep 4
+done
+logger -t ouster-beam "gave up fetching beam geometry from $SENSOR after $TRIES tries"
+exit 1

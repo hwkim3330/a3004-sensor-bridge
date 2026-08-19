@@ -87,6 +87,10 @@ EOF
 # destination is configured.
 uci -q batch <<'EOF'
 set ouster-edge.lidar.enabled='1'
+# The IMU, which the sensor sends whether or not anyone listens. It answers the
+# one question a range scan cannot: whether the vehicle is level. A 2D map assumes
+# it is, and a ramp makes that assumption quietly false.
+set ouster-edge.lidar.imu_port='7503'
 commit ouster-edge
 EOF
 
