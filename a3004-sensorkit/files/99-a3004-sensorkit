@@ -91,6 +91,21 @@ set ouster-edge.lidar.enabled='1'
 # one question a range scan cannot: whether the vehicle is level. A 2D map assumes
 # it is, and a ramp makes that assumption quietly false.
 set ouster-edge.lidar.imu_port='7503'
+# The range image, at full vertical resolution.
+#
+# It is what the lidar console draws its point cloud from, so the row step is the
+# cloud's vertical resolution: 1 gives 64 rows, 2 gives 32. Measured on the board
+# with the camera unplugged - which is the configuration this is for, since the USB
+# port is CAN's:
+#
+#   step 2   ouster-edge 19% of a core   range.bin 23 kB   loadavg 2.1
+#   step 1   ouster-edge 29% of a core   range.bin 46 kB   loadavg 1.0
+#
+# No missed columns either way and slam2d kept matching every ring, and 46 kB three
+# times a second is 138 kB/s, which wifi does not notice. The camera's 41% of a core
+# pays for it.
+set ouster-edge.lidar.range_image='1'
+set ouster-edge.lidar.range_step='1'
 commit ouster-edge
 EOF
 
