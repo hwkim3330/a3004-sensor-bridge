@@ -55,6 +55,28 @@ static struct {
 	int port;			/* HTTP port for the browser */
 	struct sockaddr_in peer;	/* where intent is forwarded */
 	bool have_peer;
+	/*
+	 * Where the accepted intent is echoed, for anything that wants to watch
+	 * rather than act on it.
+	 *
+	 * The reason this exists: a behaviour-cloning recorder needs the scan the
+	 * operator was looking at and the intent they gave, and the only place both
+	 * exist together is wherever the driving happens. That was the PC console,
+	 * so demonstrations driven from the tablet - which is what somebody walking
+	 * behind the vehicle actually uses - could not be recorded at all.
+	 *
+	 * Broadcasting a copy fixes it once for every operator instead of once per
+	 * operator: whoever is driving, the router says what it accepted, and any
+	 * recorder on the network pairs it with the ring it already receives. It is
+	 * the same arrangement ouster-edge uses for the ring.
+	 *
+	 * Independent of have_peer on purpose. agx-cmd is off by default, so
+	 * forwarding is usually off, and the intent is still worth recording - a
+	 * session spent learning to drive the thing is a session worth keeping.
+	 */
+	struct sockaddr_in echo;
+	bool have_echo;
+	uint64_t echoed;
 	int cmd_port;			/* UDP command input, 0 = off */
 	int rate_hz;			/* forward cadence */
 	int timeout_ms;			/* deadman */
@@ -138,7 +160,7 @@ static void forward(int sock)
 	uint64_t t = now_ms();
 	int i;
 
-	if (!g.have_peer || sock < 0)
+	if (sock < 0 || (!g.have_peer && !g.have_echo))
 		return;
 
 	memset(p, 0, sizeof(p));
@@ -159,9 +181,18 @@ static void forward(int sock)
 	p[28] = (uint8_t)(g.buttons & 0xff);
 	p[29] = (uint8_t)(g.buttons >> 8);
 
-	if (sendto(sock, p, sizeof(p), 0, (struct sockaddr *)&g.peer,
+	if (g.have_peer &&
+	    sendto(sock, p, sizeof(p), 0, (struct sockaddr *)&g.peer,
 		   sizeof(g.peer)) == (ssize_t)sizeof(p))
 		g.sent++;
+
+	/* The echo is not the command path and must never be mistaken for it: a
+	 * failure here is counted and otherwise ignored, where a failure to reach
+	 * agx-cmd matters. */
+	if (g.have_echo &&
+	    sendto(sock, p, sizeof(p), 0, (struct sockaddr *)&g.echo,
+		   sizeof(g.echo)) == (ssize_t)sizeof(p))
+		g.echoed++;
 }
 
 static void status_write(void)
@@ -184,6 +215,8 @@ static void status_write(void)
 	fprintf(f, "\t\"timeout_ms\": %d,\n", g.timeout_ms);
 	fprintf(f, "\t\"rate_hz\": %d,\n", g.rate_hz);
 	fprintf(f, "\t\"forwarding\": %s,\n", g.have_peer ? "true" : "false");
+	fprintf(f, "\t\"echoing\": %s,\n", g.have_echo ? "true" : "false");
+	fprintf(f, "\t\"echoed\": %llu,\n", (unsigned long long)g.echoed);
 	fprintf(f, "\t\"commands\": %llu,\n", (unsigned long long)g.commands);
 	fprintf(f, "\t\"rejected_seq\": %llu,\n",
 		(unsigned long long)g.rejected_seq);
@@ -477,6 +510,12 @@ static void usage(const char *a0)
 	fprintf(stderr,
 "Usage: %s [options]\n"
 "  -p, --port PORT        HTTP port the browser posts to (default 8083)\n"
+"  -e, --echo HOST:PORT   also send every accepted frame here, for recorders\n"
+"                         and dashboards (default port 7723). A broadcast\n"
+"                         address works and is the point: whoever is driving,\n"
+"                         anything on the network can pair the intent with the\n"
+"                         ring. Independent of --remote, because agx-cmd is\n"
+"                         usually off and the intent is still worth keeping\n"
 "  -r, --remote HOST:PORT forward intent here as TELE (default 7722,\n"
 "                         which is agx-cmd)\n"
 "  -H, --rate HZ          forward cadence (default 20)\n"
@@ -509,6 +548,7 @@ int main(int argc, char **argv)
 	static const struct option opts[] = {
 		{ "port",       required_argument, NULL, 'p' },
 		{ "remote",     required_argument, NULL, 'r' },
+		{ "echo",       required_argument, NULL, 'e' },
 		{ "rate",       required_argument, NULL, 'H' },
 		{ "cmd-port",   required_argument, NULL, 'c' },
 		{ "timeout",    required_argument, NULL, 't' },
@@ -529,7 +569,7 @@ int main(int argc, char **argv)
 	g.timeout_ms = 300;
 	g.status_path = (char *)"/var/run/teleop.json";
 
-	while ((opt = getopt_long(argc, argv, "p:r:H:c:t:S:fh", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:r:e:H:c:t:S:fh", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'p': g.port = atoi(optarg); break;
 		case 'r':
@@ -538,6 +578,13 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			g.have_peer = true;
+			break;
+		case 'e':
+			if (!parse_hostport(optarg, &g.echo, 7723)) {
+				fprintf(stderr, "bad --echo '%s'\n", optarg);
+				return 1;
+			}
+			g.have_echo = true;
 			break;
 		case 'H': g.rate_hz = atoi(optarg); break;
 		case 'c': g.cmd_port = atoi(optarg); break;
@@ -586,11 +633,19 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (g.have_peer) {
+	if (g.have_peer || g.have_echo) {
 		usock = socket(AF_INET, SOCK_DGRAM, 0);
-		if (usock >= 0)
+		if (usock >= 0) {
 			fcntl(usock, F_SETFL,
 			      fcntl(usock, F_GETFL, 0) | O_NONBLOCK);
+			/* The echo is meant to be broadcast - that is what makes it
+			 * useful to a recorder that does not know who is driving -
+			 * and a broadcast address needs this or every send fails
+			 * with EACCES. Set unconditionally: it changes nothing for a
+			 * unicast destination. */
+			setsockopt(usock, SOL_SOCKET, SO_BROADCAST, &on,
+				   sizeof(on));
+		}
 	}
 
 	if (g.cmd_port > 0) {
@@ -621,6 +676,9 @@ int main(int argc, char **argv)
 	       "teleop on :%d, %d Hz, deadman %d ms, forwarding %s",
 	       g.port, g.rate_hz, g.timeout_ms,
 	       g.have_peer ? "on" : "off");
+	if (g.have_echo)
+		logmsg(LOG_NOTICE, "echoing accepted frames to :%d",
+		       ntohs(g.echo.sin_port));
 
 	while (!stop_requested) {
 		int np = 0, wait_ms;

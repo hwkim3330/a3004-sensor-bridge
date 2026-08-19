@@ -7,7 +7,7 @@ USE_PROCD=1
 PROG=/usr/sbin/teleop
 
 start_service() {
-	local enabled port remote rate timeout cmd_port
+	local enabled port remote echo rate timeout cmd_port
 
 	config_load teleop
 	config_get_bool enabled control enabled 0
@@ -15,6 +15,7 @@ start_service() {
 
 	config_get port    control port 8083
 	config_get remote  control remote
+	config_get echo    control echo
 	config_get rate    control rate 20
 	config_get timeout control timeout 300
 	config_get cmd_port control cmd_port 7721
@@ -28,6 +29,7 @@ start_service() {
 		--status /var/run/teleop.json
 
 	[ -n "$remote" ] && procd_append_param command --remote "$remote"
+	[ -n "$echo" ] && procd_append_param command --echo "$echo"
 
 	# Paced rather than unlimited-and-instant: a device that is not
 	# plugged in yet must not become a hot restart loop.
@@ -37,6 +39,7 @@ start_service() {
 	procd_close_instance
 
 	[ -n "$remote" ] && logger -t teleop "forwarding control intent to $remote"
+	[ -n "$echo" ] && logger -t teleop "echoing accepted frames to $echo"
 }
 
 stop_service() {

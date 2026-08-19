@@ -40,6 +40,7 @@ RING_PORT = 7602        # ouster-edge's ring, broadcast
 TELEOP_PORT = 7721      # teleop, TCMD 24 B - operator intent
 NAV_PORT = 7604         # navigate, "GOAL x y" / "ROUTE ..." / "STOP"
 MAP_PORT = 7605         # slam2d, "SAVE path" / "LOAD path" / "RESET"
+ECHO_PORT = 7723        # teleop's broadcast copy of what it accepted
 CAM_PORT = 8080
 MIC_PORT = 8082
 TELE_HZ = 50
@@ -252,6 +253,54 @@ class Ring:
                 self.on_ring(self.cm)
 
 
+class Echo:
+    """What teleop accepted, from teleop, whoever asked for it.
+
+    The recorder used to pair the ring with *this* console's own intent, which
+    silently meant it could only record demonstrations driven from a browser at a
+    desk. The way somebody actually drives a robot indoors is walking behind it
+    with the tablet - and those sessions, the ones worth cloning, produced nothing.
+
+    teleop now broadcasts every frame it accepts, so the intent has one source
+    regardless of the operator. It is also the *accepted* intent rather than the
+    requested one: what got past the sequence check and the deadman, which is what
+    the vehicle would have been told, and therefore what a policy should learn.
+    """
+
+    def __init__(self):
+        self.armed = False
+        self.x = self.y = self.r = 0.0
+        self.at = 0.0
+        self.frames = 0
+
+    def start(self, loop):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", ECHO_PORT))
+        s.setblocking(False)
+        self.sock = s
+        loop.add_reader(s.fileno(), self._drain)
+
+    def _drain(self):
+        while True:
+            try:
+                d = self.sock.recv(2048)
+            except (BlockingIOError, OSError):
+                return
+            if len(d) < 26 or d[:4] != b"TELE":
+                continue
+            self.armed = bool(d[5])
+            # Axes are int16 in 1/10000, in the order strafe, forward, yaw.
+            self.x, self.y, self.r = (
+                struct.unpack_from("<3h", d, 20)[i] / 10000.0 for i in range(3))
+            self.at = time.time()
+            self.frames += 1
+
+    @property
+    def live(self):
+        return self.at and (time.time() - self.at) < 1.0
+
+
 class Recorder:
     """Episodes of (what the lidar saw, what the operator asked for).
 
@@ -282,11 +331,17 @@ class Recorder:
         self.name = name
         self.written = None
 
-    def add(self, cm, drv, pose):
+    def add(self, cm, src, pose):
+        """`src` is whatever is authoritative about the operator's intent.
+
+        The echo when teleop is broadcasting, because that covers every operator
+        including the tablet; this console's own driver when it is not, so a
+        recording is still possible on a router without the echo configured.
+        """
         if not self.on:
             return
-        self.rows.append((time.time(), cm, drv.x, drv.y, drv.r,
-                          1 if drv.armed else 0, pose))
+        self.rows.append((time.time(), cm, src.x, src.y, src.r,
+                          1 if src.armed else 0, pose))
 
     def stop(self):
         self.on = False
@@ -572,7 +627,11 @@ async def ws_handler(request):
                           "x": round(drv.x, 3), "y": round(drv.y, 3),
                           "r": round(drv.r, 3)},
                 "rec": {"on": rec.on, "rows": len(rec.rows),
-                        "written": rec.written},
+                        "written": rec.written,
+                        # Which intent the rows are carrying, so a recording made
+                        # from the tablet is visibly not a recording of nothing.
+                        "src": "teleop echo" if app["echo"].live else "this console",
+                        "echoed": app["echo"].frames},
             })
             await asyncio.sleep(0.2)
 
@@ -628,12 +687,17 @@ async def ws_handler(request):
 async def on_start(app):
     loop = asyncio.get_running_loop()
     app["ring"].start(loop)
+    app["echo"].start(loop)
     def _pose():
         p = ((app["state"].get("status", {}).get("slam2d") or {})
              .get("pose_cm") or {})
         return (p.get("x", 0), p.get("y", 0), p.get("a", 0))
 
-    app["ring"].on_ring = lambda cm: app["rec"].add(cm, app["drv"], _pose())
+    def _on_ring(cm):
+        echo = app["echo"]
+        app["rec"].add(cm, echo if echo.live else app["drv"], _pose())
+
+    app["ring"].on_ring = _on_ring
     app["state"]["tasks"] = [
         asyncio.create_task(app["cam"].run()),
         asyncio.create_task(app["mic"].run()),
@@ -669,6 +733,7 @@ def main():
     app["cam"] = Camera(f"http://{a.host}:{CAM_PORT}/stream")
     app["mic"] = Mic(f"http://{a.host}:{MIC_PORT}")
     app["ring"] = Ring()
+    app["echo"] = Echo()
     app["drv"] = Driver(a.host)
     app["state"] = {"status": {}}
     app["rec"] = Recorder(pathlib.Path(__file__).resolve().parent / "episodes")

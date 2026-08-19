@@ -29,6 +29,7 @@ together.
 | 7701 | UDP | can-bridge | a host that may inject | `BCAN` frame datagrams |
 | 7721 | UDP | teleop | tablet, console | `TCMD`, 24 B — operator intent |
 | **7722** | UDP | agx-cmd | teleop, navigate | `TELE`, 32 B — motion command |
+| 7723 | UDP | anything watching | teleop | `TELE`, 32 B — a broadcast copy of what teleop accepted |
 | 8080 | TCP | ustreamer | tablet, browser | MJPEG |
 | 8082 | TCP | mic-stream | tablet | PCM |
 | 8083 | TCP | teleop | browser | its own control page |
