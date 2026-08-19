@@ -259,10 +259,37 @@ static void handle_ring(const uint8_t *p, size_t len)
 	}
 
 	seed = g.pose;
+	/*
+	 * The constant-velocity seed, and a limit on how much it may believe.
+	 *
+	 * Extrapolating the last step is right for a vehicle and wrong for a bad
+	 * match: one wrong match makes the next seed twice as wrong, and the scan
+	 * after that four times, so a single bad ring can run the pose off to
+	 * millions of metres in seconds. Watched happening on the bench after the
+	 * channel band was widened for an experiment - the ring collapsed to the
+	 * floor, the pose left the building, and every match afterwards reported
+	 * at_search_edge with a score of zero.
+	 *
+	 * A step larger than the search window cannot be confirmed by matching
+	 * anyway - the window is what the matcher can look inside - so a seed that
+	 * asks for more than that is asking for something unverifiable. Clamped to
+	 * it: the vehicle can still be seeded forwards, and a runaway cannot compound.
+	 */
 	if (g.have_prev) {
-		seed.x_cm = g.pose.x_cm + (g.pose.x_cm - g.prev.x_cm);
-		seed.y_cm = g.pose.y_cm + (g.pose.y_cm - g.prev.y_cm);
-		seed.a = (g.pose.a + (g.pose.a - g.prev.a)) & S2_ANG_MASK;
+		int32_t dx = g.pose.x_cm - g.prev.x_cm;
+		int32_t dy = g.pose.y_cm - g.prev.y_cm;
+		int32_t da = ((g.pose.a - g.prev.a + S2_TURN / 2) & S2_ANG_MASK)
+			     - S2_TURN / 2;
+		int32_t lim = g.win_xy_cm > 0 ? g.win_xy_cm : 40;
+
+		if (dx > lim) dx = lim; else if (dx < -lim) dx = -lim;
+		if (dy > lim) dy = lim; else if (dy < -lim) dy = -lim;
+		if (da > g.win_a) da = g.win_a;
+		else if (da < -g.win_a) da = -g.win_a;
+
+		seed.x_cm = g.pose.x_cm + dx;
+		seed.y_cm = g.pose.y_cm + dy;
+		seed.a = (g.pose.a + da) & S2_ANG_MASK;
 	}
 
 	t0 = now_us();
@@ -537,6 +564,11 @@ int main(int argc, char **argv)
 					path++;
 				if (*path && s2_map_read_export(&g.map, &saved, path)) {
 					g.pose = saved;
+					/* The stored pose is a jump, not a step:
+					 * carrying the old velocity across it would
+					 * seed the first match from a movement that
+					 * never happened. */
+					g.have_prev = false;
 					/* Bounded explicitly rather than left to
 					 * snprintf: truncation is what is wanted
 					 * here, but saying so removes a warning
@@ -563,6 +595,19 @@ int main(int argc, char **argv)
 				if (s2_map_init(&g.map, g.map_cm, g.map_cm,
 						g.res_cm)) {
 					g.pose.x_cm = g.pose.y_cm = g.pose.a = 0;
+					/*
+					 * The motion model goes with it.
+					 *
+					 * RESET cleared the map and the pose and
+					 * left `prev` holding wherever the pose had
+					 * got to - so the very next seed was the
+					 * difference between zero and that, and a
+					 * reset made a runaway worse instead of
+					 * curing it. Only restarting the process
+					 * fixed it, which is not something a button
+					 * on a tablet can do.
+					 */
+					g.have_prev = false;
 					/* Nothing is loaded any more, and saying
 					 * otherwise would name a survey that is
 					 * no longer on the grid. */
