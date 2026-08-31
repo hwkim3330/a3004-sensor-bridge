@@ -16,7 +16,14 @@
 # Written to a temporary name and moved, so a reader never sees half a file.
 SENSOR="${1:-192.168.1.50}"
 OUT=/var/run/beam.json
-TRIES="${2:-30}"
+# Long enough to cover a sensor that is powered after the router.
+#
+# 30 tries at 4 s covered a sensor booting alongside the router and nothing else.
+# On this bench the router came up first with the lidar switched off, the fetch gave
+# up after two minutes, and the file never appeared - so the 3D view stayed dead
+# with "no beam geometry" long after the sensor was back. The geometry is per-unit
+# calibration that never changes, so waiting a long time for it costs nothing.
+TRIES="${2:-450}"
 
 i=0
 while [ "$i" -lt "$TRIES" ]; do
