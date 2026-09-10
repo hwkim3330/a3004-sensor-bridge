@@ -112,7 +112,24 @@ def run_profile(profile, expect_size):
             size_seen = len(pkt)
             tx.sendto(pkt, ("127.0.0.1", PORT))
             time.sleep(0.0004)
-    time.sleep(0.8)
+
+    # Wait for the daemon to have accounted for every packet, rather than
+    # sleeping a fixed amount and hoping. A flat sleep(0.8) here failed roughly
+    # one CI run in two with "json packets: got 127 want 128" - one short, with
+    # missed_columns still 0 - because on a loaded runner the last packet had not
+    # been folded into the status file by the time it was read. Polling removes
+    # the timing dependence without weakening the assertion: if the count really
+    # never arrives, this still ends up short and the check below still fails.
+    expect_packets = 2 * WIDTH // COLS
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        try:
+            with open(STATUS) as fh:
+                if json.load(fh).get("packets") >= expect_packets:
+                    break
+        except (OSError, ValueError, TypeError):
+            pass          # mid-write, or not written yet
+        time.sleep(0.02)
 
     check("packet size", size_seen, expect_size)
 
@@ -149,7 +166,7 @@ def run_profile(profile, expect_size):
 
     with open(STATUS) as fh:
         st = json.load(fh)
-    check("json packets", st["packets"], 2 * WIDTH // COLS)
+    check("json packets", st["packets"], expect_packets)
     check("json bad_size", st["bad_size"], 0)
     check("json invalid_columns", st["invalid_columns"], 0)
     check("json missed_columns", st["missed_columns"], 0)
