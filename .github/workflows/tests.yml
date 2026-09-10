@@ -1,0 +1,72 @@
+# Runs the sensor-bridge test suites on every push.
+#
+# These are the suites that need no target hardware: the Ouster parser against
+# synthesised packets, the i-BUS decoder against a pty, the teleop safety
+# properties, and the AFHDS 2A frame builders. Together they are what stands in
+# for a lidar and an RC receiver that are not on the bench, so a regression in
+# them is a regression nobody would otherwise notice until the hardware arrived.
+#
+# The vehicle-side suites - the AgileX decoder, the CAN bridge against vcan, and
+# the agx-cmd safety properties - moved with their code to
+# https://github.com/hwkim3330/agilex-scout-mini and run there.
+#
+# The OpenWrt image build is not here on purpose: it needs a toolchain build, and
+# upstream's own build-pr-profile workflow already covers the device profile.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ouster-edge
+        working-directory: ouster-edge/test
+        run: |
+          # -lm because the IMU tilt uses atan2 and sqrt. It is not needed for
+          # the target build - musl keeps the maths in libc - so the package
+          # compiled for MIPS while this job did not link, which is exactly the
+          # gap a CI on a different libc exists to catch.
+          cc -O2 -Wall -Wextra -Werror -o ouster-edge ../src/ouster-edge.c -lm
+          OUSTER_EDGE_BIN=./ouster-edge python3 test_profiles.py
+          OUSTER_EDGE_BIN=./ouster-edge python3 test_accounting.py
+          OUSTER_EDGE_BIN=./ouster-edge python3 test_latency.py
+          OUSTER_EDGE_BIN=./ouster-edge python3 test_zones.py
+          sh test_metadata.sh
+
+      - name: rc-ibus
+        working-directory: rc-ibus/test
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o rc-ibus ../src/rc-ibus.c
+          RC_IBUS_BIN=./rc-ibus python3 test_ibus.py
+
+      - name: teleop
+        working-directory: teleop/test
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o teleop ../src/teleop.c
+          TELEOP_BIN=./teleop python3 test_teleop.py
+
+      - name: afhds2a frame builders
+        working-directory: rc-tx/test
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o test_afhds2a test_afhds2a.c ../src/afhds2a.c
+          ./test_afhds2a
+
+      - name: shell syntax of everything shipped
+        run: |
+          fail=0
+          for f in $(find . -path ./.git -prune -o -type f \( -name '*.init' \
+                     -o -name '*.hotplug' -o -name 'flash-router' \
+                     -o -name 'sensor-probe' -o -name 'sensor-lan-tune' \
+                     -o -name 'ouster-metadata' -o -name 'ouster-beam-fetch' \
+                     -o -name 'first-boot-report' \
+                     -o -name '99-a3004-sensorkit' \) -print); do
+            sh -n "$f" || { echo "FAIL $f"; fail=1; }
+          done
+          exit $fail
